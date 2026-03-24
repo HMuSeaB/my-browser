@@ -1200,7 +1200,9 @@ func (a *App) OpenDataDirectory() error {
 		return fmt.Errorf("创建数据目录失败: %v", err)
 	}
 
-	cmd := exec.Command("explorer.exe", dataDir)
+	// Use the shell to open Explorer so we can hide the transient cmd window
+	// without hiding the actual file explorer window itself.
+	cmd := exec.Command("cmd", "/c", "start", "", dataDir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("打开数据目录失败: %v", err)

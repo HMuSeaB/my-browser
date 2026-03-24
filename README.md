@@ -2,7 +2,9 @@
 
 MyBrowser Pro 是一款基于 Go + Wails + Vue 3 开发的轻量级、深度反检测浏览器。它集成了 **Camoufox** 内核，通过 C++ 底层注入技术提供高强度的指纹保护，专为隐私保护、多账号管理及电商/社媒环境设计。
 
-![UI Preview](https://raw.githubusercontent.com/wailsapp/wails/master/website/static/img/wails-logo.png) <!-- TODO: 替换为实机截图 -->
+![MyBrowser Screenshot](./docs/images/readme-screenshot.png)
+
+> Desktop UI preview with redacted demo profiles and local-only storage controls.
 
 ## 🚀 核心特性
 
@@ -65,3 +67,4 @@ wails build
 
 ## 📄 开源协议
 MIT License
+
