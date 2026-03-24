@@ -1,0 +1,9 @@
+build/bin
+node_modules
+frontend/camoufox/
+/camoufox-*/
+data/
+MyBrowserData/
+portable.flag
+*.mbp
+135.0.1-beta.24-win.x86_64/
