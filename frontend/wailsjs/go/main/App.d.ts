@@ -6,7 +6,7 @@ export function AddProxy(arg1:string,arg2:string):Promise<main.ProxyEntry>;
 
 export function CreateDesktopShortcut():Promise<void>;
 
-export function CreateProfile(arg1:string,arg2:string,arg3:string):Promise<main.BrowserProfile>;
+export function CreateProfile(arg1:string,arg2:string,arg3:string,arg4:string):Promise<main.BrowserProfile>;
 
 export function DeleteProfile(arg1:string):Promise<void>;
 

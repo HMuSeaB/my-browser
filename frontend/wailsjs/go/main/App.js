@@ -10,8 +10,8 @@ export function CreateDesktopShortcut() {
   return window['go']['main']['App']['CreateDesktopShortcut']();
 }
 
-export function CreateProfile(arg1, arg2, arg3) {
-  return window['go']['main']['App']['CreateProfile'](arg1, arg2, arg3);
+export function CreateProfile(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['CreateProfile'](arg1, arg2, arg3, arg4);
 }
 
 export function DeleteProfile(arg1) {

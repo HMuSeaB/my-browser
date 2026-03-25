@@ -27,10 +27,11 @@ import (
 type BrowserProfile struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
-	Proxy    string `json:"proxy"`    // 格式: type://user:pass@host:port
-	UA       string `json:"ua"`       // User-Agent
-	Platform string `json:"platform"` // Windows/macOS/Linux
-	Cookies  string `json:"cookies"`  // JSON 格式的 Cookie 字符串
+	Proxy    string `json:"proxy"`     // 格式: type://user:pass@host:port
+	StartURL string `json:"start_url"` // 默认启动页
+	UA       string `json:"ua"`        // User-Agent
+	Platform string `json:"platform"`  // Windows/macOS/Linux
+	Cookies  string `json:"cookies"`   // JSON 格式的 Cookie 字符串
 	CreateAt int64  `json:"create_at"`
 }
 
@@ -466,19 +467,46 @@ func (a *App) Log(level, message string) {
 	runtime.EventsEmit(a.ctx, "log_update", logEntry)
 }
 
+func normalizeStartURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
+	}
+
+	if !strings.Contains(trimmed, "://") {
+		trimmed = "https://" + trimmed
+	}
+
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" {
+		return "", fmt.Errorf("默认标签页格式无效，请输入有效域名或 http(s) 地址")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("默认标签页仅支持 http 或 https")
+	}
+
+	return parsed.String(), nil
+}
+
 // CreateProfile 创建新环境
-func (a *App) CreateProfile(name, proxy, ua string) (BrowserProfile, error) {
+func (a *App) CreateProfile(name, proxy, ua, startURL string) (BrowserProfile, error) {
+	normalizedStartURL, err := normalizeStartURL(startURL)
+	if err != nil {
+		return BrowserProfile{}, err
+	}
+
 	newProfile := BrowserProfile{
 		ID:       uuid.New().String(),
 		Name:     name,
 		Proxy:    proxy,
+		StartURL: normalizedStartURL,
 		UA:       ua,
 		Platform: "Windows",
 		Cookies:  "[]",
 		CreateAt: time.Now().Unix(),
 	}
 	a.profiles = append(a.profiles, newProfile)
-	err := a.saveProfiles()
+	err = a.saveProfiles()
 	return newProfile, err
 }
 
@@ -495,6 +523,12 @@ func (a *App) DeleteProfile(id string) error {
 
 // UpdateProfile 更新环境配置
 func (a *App) UpdateProfile(updated BrowserProfile) error {
+	normalizedStartURL, err := normalizeStartURL(updated.StartURL)
+	if err != nil {
+		return err
+	}
+	updated.StartURL = normalizedStartURL
+
 	for i, p := range a.profiles {
 		if p.ID == updated.ID {
 			a.profiles[i] = updated
@@ -991,6 +1025,10 @@ func (a *App) LaunchBrowser(profileID string, startURL string) error {
 	args := []string{
 		"--profile", userDataDir,
 		"--no-remote",
+	}
+
+	if startURL == "" {
+		startURL = profile.StartURL
 	}
 
 	if startURL != "" {

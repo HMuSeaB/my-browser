@@ -4,6 +4,7 @@ export namespace main {
 	    id: string;
 	    name: string;
 	    proxy: string;
+	    start_url: string;
 	    ua: string;
 	    platform: string;
 	    cookies: string;
@@ -18,6 +19,7 @@ export namespace main {
 	        this.id = source["id"];
 	        this.name = source["name"];
 	        this.proxy = source["proxy"];
+	        this.start_url = source["start_url"];
 	        this.ua = source["ua"];
 	        this.platform = source["platform"];
 	        this.cookies = source["cookies"];

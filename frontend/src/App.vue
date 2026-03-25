@@ -31,6 +31,7 @@ const newProfile = ref({
   name: '',
   proxyType: 'socks5://',
   proxyAddr: '127.0.0.1:7891', // Clash 默认 SOCKS 端口
+  startUrl: '',
   ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0'
 })
 
@@ -122,7 +123,7 @@ const handleCreate = async () => {
   if (!newProfile.value.name) return alert('请输入环境名称')
   const fullProxy = newProfile.value.proxyAddr ? newProfile.value.proxyType + newProfile.value.proxyAddr : ''
   try {
-    await CreateProfile(newProfile.value.name, fullProxy, newProfile.value.ua)
+    await CreateProfile(newProfile.value.name, fullProxy, newProfile.value.ua, newProfile.value.startUrl)
     showCreateModal.value = false
     resetNewProfile()
     fetchProfiles()
@@ -137,6 +138,7 @@ const resetNewProfile = () => {
         name: '', 
         proxyType: 'socks5://', 
         proxyAddr: '127.0.0.1:7891', 
+        startUrl: '',
         ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0' 
     }
 }
@@ -449,6 +451,10 @@ onMounted(async () => {
                   <span class="label">内核:</span>
                   <span class="val">Camoufox (Firefox)</span>
                 </div>
+                <div class="data-row">
+                  <span class="label">默认页:</span>
+                  <span class="val start-url">{{ p.start_url || '新标签页' }}</span>
+                </div>
               </div>
 
               <div class="card-foot">
@@ -536,6 +542,11 @@ onMounted(async () => {
               </div>
               <span class="hint" v-if="selectedProxyId === ''">Clash 默认一般为 HTTP(7890) 或 SOCKS5(7891)</span>
             </div>
+            <div class="field">
+              <label>默认标签页</label>
+              <input v-model="newProfile.startUrl" placeholder="例如 google.com 或 https://chatgpt.com" />
+              <span class="hint">留空则保持浏览器默认新标签页；未写协议时会自动补全为 https://</span>
+            </div>
           </div>
           <div class="modal-footer">
             <button @click="showCreateModal = false" class="btn-ghost">取消</button>
@@ -572,6 +583,11 @@ onMounted(async () => {
               <div v-if="proxyTestResult" class="test-res" :class="{ ok: proxyTestResult.includes('成功') }">
                 {{ proxyTestResult }}
               </div>
+            </div>
+            <div class="field">
+              <label>默认标签页</label>
+              <input v-model="editingProfile.start_url" placeholder="例如 google.com 或 https://chatgpt.com" />
+              <span class="hint">普通启动时会优先打开这里；外部链接拉起和指纹验证仍会覆盖它。</span>
             </div>
           </div>
           <div class="modal-footer">

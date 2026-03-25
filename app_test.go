@@ -6,6 +6,62 @@ import (
 	"testing"
 )
 
+func TestNormalizeStartURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "empty", input: "", want: ""},
+		{name: "domain only", input: "google.com", want: "https://google.com"},
+		{name: "https kept", input: "https://chatgpt.com", want: "https://chatgpt.com"},
+		{name: "http kept", input: "http://localhost:3000", want: "http://localhost:3000"},
+		{name: "invalid scheme", input: "ftp://example.com", wantErr: true},
+		{name: "invalid url", input: "://bad", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeStartURL(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalizeStartURL returned error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("normalizeStartURL(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUpdateProfileNormalizesStartURL(t *testing.T) {
+	app := &App{
+		profiles: []BrowserProfile{
+			{ID: "profile-1", Name: "Test"},
+		},
+		dataDir: t.TempDir(),
+	}
+
+	err := app.UpdateProfile(BrowserProfile{
+		ID:       "profile-1",
+		Name:     "Test",
+		StartURL: "chatgpt.com",
+	})
+	if err != nil {
+		t.Fatalf("UpdateProfile returned error: %v", err)
+	}
+
+	if got := app.profiles[0].StartURL; got != "https://chatgpt.com" {
+		t.Fatalf("StartURL = %q, want https://chatgpt.com", got)
+	}
+}
+
 func TestInitializeStorageUsesLocalAppData(t *testing.T) {
 	localAppData := t.TempDir()
 	t.Setenv("LOCALAPPDATA", localAppData)
