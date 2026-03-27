@@ -30,6 +30,18 @@ export function ExportProfile(arg1) {
   return window['go']['main']['App']['ExportProfile'](arg1);
 }
 
+export function GetAutomationInfo() {
+  return window['go']['main']['App']['GetAutomationInfo']();
+}
+
+export function GetAutomationSessions() {
+  return window['go']['main']['App']['GetAutomationSessions']();
+}
+
+export function GetAutomationToken() {
+  return window['go']['main']['App']['GetAutomationToken']();
+}
+
 export function GetProfiles() {
   return window['go']['main']['App']['GetProfiles']();
 }
@@ -38,16 +50,16 @@ export function GetProxies() {
   return window['go']['main']['App']['GetProxies']();
 }
 
+export function GetStartupURL() {
+  return window['go']['main']['App']['GetStartupURL']();
+}
+
 export function GetStorageDirectory() {
   return window['go']['main']['App']['GetStorageDirectory']();
 }
 
 export function GetStorageMode() {
   return window['go']['main']['App']['GetStorageMode']();
-}
-
-export function GetStartupURL() {
-  return window['go']['main']['App']['GetStartupURL']();
 }
 
 export function ImportCookiesFromFile() {
@@ -66,12 +78,12 @@ export function Log(arg1, arg2) {
   return window['go']['main']['App']['Log'](arg1, arg2);
 }
 
-export function OpenDefaultAppsSettings() {
-  return window['go']['main']['App']['OpenDefaultAppsSettings']();
-}
-
 export function OpenDataDirectory() {
   return window['go']['main']['App']['OpenDataDirectory']();
+}
+
+export function OpenDefaultAppsSettings() {
+  return window['go']['main']['App']['OpenDefaultAppsSettings']();
 }
 
 export function RegisterAsDefaultBrowser() {
@@ -80,6 +92,22 @@ export function RegisterAsDefaultBrowser() {
 
 export function ResetCookies(arg1) {
   return window['go']['main']['App']['ResetCookies'](arg1);
+}
+
+export function RotateAutomationToken() {
+  return window['go']['main']['App']['RotateAutomationToken']();
+}
+
+export function SetAutomationEnabled(arg1) {
+  return window['go']['main']['App']['SetAutomationEnabled'](arg1);
+}
+
+export function StartAutomationSession(arg1, arg2) {
+  return window['go']['main']['App']['StartAutomationSession'](arg1, arg2);
+}
+
+export function StopAutomationSession(arg1) {
+  return window['go']['main']['App']['StopAutomationSession'](arg1);
 }
 
 export function SyncCookies(arg1) {

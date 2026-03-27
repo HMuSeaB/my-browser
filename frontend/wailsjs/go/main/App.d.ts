@@ -16,15 +16,21 @@ export function ExportCookies(arg1:string):Promise<void>;
 
 export function ExportProfile(arg1:string):Promise<void>;
 
+export function GetAutomationInfo():Promise<main.AutomationInfo>;
+
+export function GetAutomationSessions():Promise<Array<main.AutomationSession>>;
+
+export function GetAutomationToken():Promise<string>;
+
 export function GetProfiles():Promise<Array<main.BrowserProfile>>;
 
 export function GetProxies():Promise<Array<main.ProxyEntry>>;
 
+export function GetStartupURL():Promise<string>;
+
 export function GetStorageDirectory():Promise<string>;
 
 export function GetStorageMode():Promise<string>;
-
-export function GetStartupURL():Promise<string>;
 
 export function ImportCookiesFromFile():Promise<string>;
 
@@ -34,13 +40,21 @@ export function LaunchBrowser(arg1:string,arg2:string):Promise<void>;
 
 export function Log(arg1:string,arg2:string):Promise<void>;
 
-export function OpenDefaultAppsSettings():Promise<void>;
-
 export function OpenDataDirectory():Promise<void>;
+
+export function OpenDefaultAppsSettings():Promise<void>;
 
 export function RegisterAsDefaultBrowser():Promise<string>;
 
 export function ResetCookies(arg1:string):Promise<void>;
+
+export function RotateAutomationToken():Promise<string>;
+
+export function SetAutomationEnabled(arg1:boolean):Promise<void>;
+
+export function StartAutomationSession(arg1:string,arg2:string):Promise<main.AutomationSession>;
+
+export function StopAutomationSession(arg1:string):Promise<void>;
 
 export function SyncCookies(arg1:string):Promise<void>;
 

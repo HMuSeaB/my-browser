@@ -1,8 +1,12 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -210,6 +214,175 @@ func TestInitializeStorageFallsBackToLaterLegacyDirectory(t *testing.T) {
 	assertFileContent(t, filepath.Join(targetDir, "profiles.json"), `{"legacy":"workspace"}`)
 	if app.storageMigrationNote == "" {
 		t.Fatal("expected migration note for fallback legacy directory")
+	}
+}
+
+func TestGenerateAutomationToken(t *testing.T) {
+	tokenA, err := generateAutomationToken()
+	if err != nil {
+		t.Fatalf("generateAutomationToken returned error: %v", err)
+	}
+	tokenB, err := generateAutomationToken()
+	if err != nil {
+		t.Fatalf("generateAutomationToken returned error: %v", err)
+	}
+
+	if tokenA == "" || tokenB == "" {
+		t.Fatal("expected non-empty automation tokens")
+	}
+	if tokenA == tokenB {
+		t.Fatal("expected unique automation tokens")
+	}
+}
+
+func TestBuildAutomationConnectURL(t *testing.T) {
+	got := buildAutomationConnectURL(45678)
+	want := "ws://127.0.0.1:45678/session"
+	if got != want {
+		t.Fatalf("buildAutomationConnectURL = %q, want %q", got, want)
+	}
+}
+
+func TestExtractBidiConnectURL(t *testing.T) {
+	line := "WebDriver BiDi listening on ws://127.0.0.1:46249"
+	got, ok := extractBidiConnectURL(line)
+	if !ok {
+		t.Fatal("expected to extract a BiDi URL")
+	}
+	if got != "ws://127.0.0.1:46249/session" {
+		t.Fatalf("extractBidiConnectURL = %q", got)
+	}
+}
+
+func TestHandleAutomationInfoRequiresBearerToken(t *testing.T) {
+	app := &App{
+		automationConfig: AutomationConfig{
+			Enabled:       true,
+			APIListenAddr: "127.0.0.1:9090",
+			APIToken:      "secret-token",
+		},
+		automationSessions: map[string]*AutomationSession{},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/automation/info", nil)
+	rec := httptest.NewRecorder()
+
+	app.handleAutomationInfo(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestHandleAutomationInfoReturnsMetadata(t *testing.T) {
+	app := &App{
+		automationConfig: AutomationConfig{
+			Enabled:       true,
+			APIListenAddr: "127.0.0.1:9090",
+			APIToken:      "secret-token",
+		},
+		automationListenAddr: "127.0.0.1:9090",
+		automationSessions: map[string]*AutomationSession{
+			"one": {SessionID: "one"},
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/automation/info", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	rec := httptest.NewRecorder()
+
+	app.handleAutomationInfo(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var payload automationResponse
+	if err := json.NewDecoder(strings.NewReader(rec.Body.String())).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !payload.Success {
+		t.Fatalf("expected success response, got %+v", payload)
+	}
+
+	dataBytes, err := json.Marshal(payload.Data)
+	if err != nil {
+		t.Fatalf("marshal nested data: %v", err)
+	}
+
+	var info AutomationInfo
+	if err := json.Unmarshal(dataBytes, &info); err != nil {
+		t.Fatalf("unmarshal info: %v", err)
+	}
+	if info.BaseURL != "http://127.0.0.1:9090" {
+		t.Fatalf("base_url = %q", info.BaseURL)
+	}
+	if info.SessionCount != 1 {
+		t.Fatalf("session_count = %d, want 1", info.SessionCount)
+	}
+}
+
+func TestStartAutomationSessionReturnsExistingSessionForSameProfile(t *testing.T) {
+	app := &App{
+		profiles: []BrowserProfile{
+			{ID: "profile-1", Name: "Profile A"},
+		},
+		automationConfig: AutomationConfig{
+			Enabled:       true,
+			APIListenAddr: "127.0.0.1:9090",
+			APIToken:      "secret-token",
+		},
+		automationSessions: map[string]*AutomationSession{
+			"session-1": {
+				SessionID:   "session-1",
+				ProfileID:   "profile-1",
+				ProfileName: "Profile A",
+				Status:      "running",
+				DebugPort:   45678,
+				ConnectURL:  "ws://127.0.0.1:45678/session",
+				Protocol:    "bidi",
+			},
+		},
+		automationRuntimes: map[string]*automationSessionRuntime{},
+	}
+
+	session, err := app.StartAutomationSession("profile-1", "")
+	if err != nil {
+		t.Fatalf("StartAutomationSession returned error: %v", err)
+	}
+
+	if session.SessionID != "session-1" {
+		t.Fatalf("expected existing session to be reused, got %q", session.SessionID)
+	}
+	if len(app.automationSessions) != 1 {
+		t.Fatalf("expected only one automation session, got %d", len(app.automationSessions))
+	}
+}
+
+func TestSetAutomationEnabledRequiresNoActiveSessionsWhenDisabling(t *testing.T) {
+	app := &App{
+		dataDir: t.TempDir(),
+		automationConfig: AutomationConfig{
+			Enabled:       true,
+			APIListenAddr: "127.0.0.1:9090",
+			APIToken:      "secret-token",
+		},
+		automationSessions: map[string]*AutomationSession{
+			"session-1": {
+				SessionID: "session-1",
+				ProfileID: "profile-1",
+				Status:    "running",
+			},
+		},
+		automationRuntimes: map[string]*automationSessionRuntime{},
+	}
+
+	err := app.SetAutomationEnabled(false)
+	if err == nil {
+		t.Fatal("expected disabling automation to fail when sessions are active")
+	}
+	if !app.automationConfig.Enabled {
+		t.Fatal("expected automation to remain enabled after failure")
 	}
 }
 

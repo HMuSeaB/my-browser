@@ -2,8 +2,11 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,7 +16,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -45,6 +51,50 @@ type ProxyEntry struct {
 	UpdatedAt int64  `json:"updated_at"`
 }
 
+type AutomationConfig struct {
+	Enabled       bool   `json:"enabled"`
+	APIListenAddr string `json:"api_listen_addr"`
+	APIToken      string `json:"api_token"`
+}
+
+type AutomationInfo struct {
+	Enabled         bool   `json:"enabled"`
+	ListenAddr      string `json:"listen_addr"`
+	BaseURL         string `json:"base_url"`
+	AuthScheme      string `json:"auth_scheme"`
+	Protocol        string `json:"protocol"`
+	SessionCount    int    `json:"session_count"`
+	TokenConfigured bool   `json:"token_configured"`
+}
+
+type AutomationSession struct {
+	SessionID   string `json:"session_id"`
+	ProfileID   string `json:"profile_id"`
+	ProfileName string `json:"profile_name"`
+	PID         int    `json:"pid"`
+	StartedAt   int64  `json:"started_at"`
+	Status      string `json:"status"`
+	DebugPort   int    `json:"debug_port"`
+	ConnectURL  string `json:"connect_url"`
+	Protocol    string `json:"protocol"`
+	StartURL    string `json:"start_url"`
+	LastError   string `json:"last_error"`
+}
+
+type AutomationProfileSummary struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Proxy    string `json:"proxy"`
+	StartURL string `json:"start_url"`
+	Platform string `json:"platform"`
+	CreateAt int64  `json:"create_at"`
+}
+
+type automationSessionRuntime struct {
+	cmd     *exec.Cmd
+	profile BrowserProfile
+}
+
 // App struct
 type App struct {
 	ctx                  context.Context
@@ -57,16 +107,46 @@ type App struct {
 	legacyDataDirs       []string
 	portableBaseDirs     []string
 	storageMigrationNote string
+	automationConfig     AutomationConfig
+	automationListenAddr string
+	automationServer     *http.Server
+	automationSessions   map[string]*AutomationSession
+	automationRuntimes   map[string]*automationSessionRuntime
+	automationMu         sync.RWMutex
 }
+
+type automationCreateRequest struct {
+	ProfileID string `json:"profile_id"`
+	StartURL  string `json:"start_url"`
+}
+
+type automationErrorPayload struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type automationResponse struct {
+	Success   bool                    `json:"success"`
+	Data      interface{}             `json:"data,omitempty"`
+	Error     *automationErrorPayload `json:"error,omitempty"`
+	RequestID string                  `json:"request_id"`
+}
+
+var bidiEndpointPattern = regexp.MustCompile(`ws://(?:127\.0\.0\.1|localhost):\d+(?:/[^\s"]*)?`)
 
 // NewApp creates a new App application struct
 func NewApp() *App {
 	a := &App{
-		profiles: []BrowserProfile{},
-		proxies:  []ProxyEntry{},
+		profiles:           []BrowserProfile{},
+		proxies:            []ProxyEntry{},
+		automationSessions: map[string]*AutomationSession{},
+		automationRuntimes: map[string]*automationSessionRuntime{},
 	}
 	if err := a.initializeStorage(); err != nil {
 		fmt.Printf("初始化存储目录失败: %v\n", err)
+	}
+	if err := a.loadAutomationConfig(); err != nil {
+		fmt.Printf("初始化自动化配置失败: %v\n", err)
 	}
 	a.loadProfiles()
 	a.loadProxies()
@@ -390,6 +470,187 @@ func (a *App) saveProxies() error {
 	return os.WriteFile(path, data, 0644)
 }
 
+func defaultAutomationConfig() AutomationConfig {
+	return AutomationConfig{
+		Enabled:       true,
+		APIListenAddr: "127.0.0.1:9090",
+	}
+}
+
+func (a *App) getAutomationConfigPath() string {
+	return filepath.Join(a.getDataDir(), "automation.json")
+}
+
+func (a *App) loadAutomationConfig() error {
+	config := defaultAutomationConfig()
+	path := a.getAutomationConfigPath()
+
+	data, err := os.ReadFile(path)
+	if err == nil {
+		if unmarshalErr := json.Unmarshal(data, &config); unmarshalErr != nil {
+			return fmt.Errorf("解析自动化配置失败: %w", unmarshalErr)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("读取自动化配置失败: %w", err)
+	}
+
+	if config.APIListenAddr == "" {
+		config.APIListenAddr = "127.0.0.1:9090"
+	}
+
+	if strings.TrimSpace(config.APIToken) == "" {
+		token, tokenErr := generateAutomationToken()
+		if tokenErr != nil {
+			return tokenErr
+		}
+		config.APIToken = token
+	}
+
+	a.automationConfig = config
+	return a.saveAutomationConfig()
+}
+
+func (a *App) saveAutomationConfig() error {
+	path := a.getAutomationConfigPath()
+	data, err := json.MarshalIndent(a.automationConfig, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+func generateAutomationToken() (string, error) {
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("生成自动化 token 失败: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func reserveTCPPort() (int, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer ln.Close()
+
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0, fmt.Errorf("无法解析监听端口")
+	}
+	return addr.Port, nil
+}
+
+func buildAutomationConnectURL(port int) string {
+	return fmt.Sprintf("ws://127.0.0.1:%d/session", port)
+}
+
+func normalizeBidiConnectURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if !strings.HasSuffix(trimmed, "/session") {
+		return strings.TrimRight(trimmed, "/") + "/session"
+	}
+	return trimmed
+}
+
+func extractBidiConnectURL(line string) (string, bool) {
+	match := bidiEndpointPattern.FindString(line)
+	if match == "" {
+		return "", false
+	}
+	return normalizeBidiConnectURL(match), true
+}
+
+func (a *App) automationSessionCount() int {
+	a.automationMu.RLock()
+	defer a.automationMu.RUnlock()
+	return len(a.automationSessions)
+}
+
+func (a *App) buildAutomationInfo() AutomationInfo {
+	listenAddr := a.automationListenAddr
+	if listenAddr == "" {
+		listenAddr = a.automationConfig.APIListenAddr
+	}
+
+	return AutomationInfo{
+		Enabled:         a.automationConfig.Enabled,
+		ListenAddr:      listenAddr,
+		BaseURL:         "http://" + listenAddr,
+		AuthScheme:      "Bearer",
+		Protocol:        "bidi",
+		SessionCount:    a.automationSessionCount(),
+		TokenConfigured: strings.TrimSpace(a.automationConfig.APIToken) != "",
+	}
+}
+
+func (a *App) copyAutomationSession(session *AutomationSession) AutomationSession {
+	if session == nil {
+		return AutomationSession{}
+	}
+	return *session
+}
+
+func (a *App) listAutomationSessions() []AutomationSession {
+	a.automationMu.RLock()
+	defer a.automationMu.RUnlock()
+
+	sessions := make([]AutomationSession, 0, len(a.automationSessions))
+	for _, session := range a.automationSessions {
+		sessions = append(sessions, *session)
+	}
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].StartedAt > sessions[j].StartedAt
+	})
+	return sessions
+}
+
+func (a *App) findAutomationSessionByProfileLocked(profileID string) *AutomationSession {
+	for _, session := range a.automationSessions {
+		if session.ProfileID == profileID && session.Status != "stopped" && session.Status != "error" {
+			return session
+		}
+	}
+	return nil
+}
+
+func (a *App) updateAutomationSession(sessionID string, updater func(*AutomationSession)) {
+	a.automationMu.Lock()
+	defer a.automationMu.Unlock()
+
+	session, ok := a.automationSessions[sessionID]
+	if !ok {
+		return
+	}
+	updater(session)
+}
+
+func (a *App) watchAutomationPipe(sessionID, stream string, reader io.ReadCloser) {
+	defer reader.Close()
+
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		if connectURL, ok := extractBidiConnectURL(line); ok {
+			a.updateAutomationSession(sessionID, func(session *AutomationSession) {
+				session.ConnectURL = connectURL
+			})
+		}
+
+		if strings.Contains(strings.ToLower(line), "webdriver bidi") || strings.Contains(strings.ToLower(line), "remote") {
+			a.Log("info", fmt.Sprintf("自动化会话 [%s] %s: %s", sessionID, stream, line))
+		}
+	}
+}
+
 func (a *App) GetProxies() []ProxyEntry {
 	return a.proxies
 }
@@ -551,6 +812,12 @@ func (a *App) startup(ctx context.Context) {
 		a.Log("info", fmt.Sprintf("检测到待处理 URL: %s，请选择环境启动...", a.StartupURL))
 	}
 
+	if err := a.startAutomationServer(); err != nil {
+		a.Log("error", fmt.Sprintf("本地自动化 API 启动失败: %v", err))
+	} else if a.automationConfig.Enabled {
+		a.Log("info", fmt.Sprintf("本地自动化 API 已启动: http://%s", a.automationListenAddr))
+	}
+
 	// 监听来自其他实例的消息 (单实例 IPC)
 	if a.listener != nil {
 		go func() {
@@ -571,6 +838,272 @@ func (a *App) startup(ctx context.Context) {
 			}
 		}()
 	}
+}
+
+func (a *App) startAutomationServer() error {
+	if !a.automationConfig.Enabled {
+		a.automationListenAddr = ""
+		return nil
+	}
+
+	if a.automationServer != nil {
+		return nil
+	}
+
+	listenAddr := strings.TrimSpace(a.automationConfig.APIListenAddr)
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1:9090"
+	}
+
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		ln, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return err
+		}
+	}
+
+	actualAddr := ln.Addr().String()
+	a.automationListenAddr = actualAddr
+	a.automationConfig.APIListenAddr = actualAddr
+	if saveErr := a.saveAutomationConfig(); saveErr != nil {
+		ln.Close()
+		return saveErr
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/automation/info", a.handleAutomationInfo)
+	mux.HandleFunc("/api/v1/automation/profiles", a.handleAutomationProfiles)
+	mux.HandleFunc("/api/v1/automation/sessions", a.handleAutomationSessions)
+	mux.HandleFunc("/api/v1/automation/sessions/", a.handleAutomationSessionByID)
+	mux.HandleFunc("/api/v1/automation/token/rotate", a.handleAutomationRotateToken)
+
+	server := &http.Server{
+		Handler:           a.withAutomationCORS(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	a.automationServer = server
+
+	go func() {
+		if serveErr := server.Serve(ln); serveErr != nil && serveErr != http.ErrServerClosed {
+			a.Log("error", fmt.Sprintf("本地自动化 API 异常退出: %v", serveErr))
+		}
+	}()
+
+	return nil
+}
+
+func (a *App) stopAutomationServer() error {
+	if a.automationServer == nil {
+		a.automationListenAddr = ""
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err := a.automationServer.Shutdown(ctx)
+	a.automationServer = nil
+	a.automationListenAddr = ""
+	if err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+func (a *App) withAutomationCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *App) requireAutomationAuth(w http.ResponseWriter, r *http.Request, requestID string) bool {
+	token := strings.TrimSpace(a.automationConfig.APIToken)
+	if token == "" {
+		a.writeAutomationJSON(w, http.StatusServiceUnavailable, requestID, nil, &automationErrorPayload{
+			Code:    "automation_unavailable",
+			Message: "本地自动化 token 未初始化",
+		})
+		return false
+	}
+
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	expected := "Bearer " + token
+	if authHeader != expected {
+		a.writeAutomationJSON(w, http.StatusUnauthorized, requestID, nil, &automationErrorPayload{
+			Code:    "unauthorized",
+			Message: "缺少有效的 Bearer token",
+		})
+		return false
+	}
+	return true
+}
+
+func (a *App) writeAutomationJSON(w http.ResponseWriter, statusCode int, requestID string, data interface{}, apiErr *automationErrorPayload) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(automationResponse{
+		Success:   apiErr == nil,
+		Data:      data,
+		Error:     apiErr,
+		RequestID: requestID,
+	})
+}
+
+func (a *App) handleAutomationInfo(w http.ResponseWriter, r *http.Request) {
+	requestID := uuid.New().String()
+	if r.Method != http.MethodGet {
+		a.writeAutomationJSON(w, http.StatusMethodNotAllowed, requestID, nil, &automationErrorPayload{
+			Code:    "method_not_allowed",
+			Message: "仅支持 GET",
+		})
+		return
+	}
+	if !a.requireAutomationAuth(w, r, requestID) {
+		return
+	}
+	a.writeAutomationJSON(w, http.StatusOK, requestID, a.buildAutomationInfo(), nil)
+}
+
+func (a *App) handleAutomationProfiles(w http.ResponseWriter, r *http.Request) {
+	requestID := uuid.New().String()
+	if r.Method != http.MethodGet {
+		a.writeAutomationJSON(w, http.StatusMethodNotAllowed, requestID, nil, &automationErrorPayload{
+			Code:    "method_not_allowed",
+			Message: "仅支持 GET",
+		})
+		return
+	}
+	if !a.requireAutomationAuth(w, r, requestID) {
+		return
+	}
+	summaries := make([]AutomationProfileSummary, 0, len(a.profiles))
+	for _, profile := range a.profiles {
+		summaries = append(summaries, AutomationProfileSummary{
+			ID:       profile.ID,
+			Name:     profile.Name,
+			Proxy:    profile.Proxy,
+			StartURL: profile.StartURL,
+			Platform: profile.Platform,
+			CreateAt: profile.CreateAt,
+		})
+	}
+	a.writeAutomationJSON(w, http.StatusOK, requestID, summaries, nil)
+}
+
+func (a *App) handleAutomationSessions(w http.ResponseWriter, r *http.Request) {
+	requestID := uuid.New().String()
+	if !a.requireAutomationAuth(w, r, requestID) {
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		a.writeAutomationJSON(w, http.StatusOK, requestID, a.listAutomationSessions(), nil)
+	case http.MethodPost:
+		var req automationCreateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			a.writeAutomationJSON(w, http.StatusBadRequest, requestID, nil, &automationErrorPayload{
+				Code:    "invalid_request",
+				Message: "请求体不是有效的 JSON",
+			})
+			return
+		}
+		session, err := a.StartAutomationSession(req.ProfileID, req.StartURL)
+		if err != nil {
+			a.writeAutomationJSON(w, http.StatusBadRequest, requestID, nil, &automationErrorPayload{
+				Code:    "start_failed",
+				Message: err.Error(),
+			})
+			return
+		}
+		a.writeAutomationJSON(w, http.StatusOK, requestID, session, nil)
+	default:
+		a.writeAutomationJSON(w, http.StatusMethodNotAllowed, requestID, nil, &automationErrorPayload{
+			Code:    "method_not_allowed",
+			Message: "仅支持 GET 或 POST",
+		})
+	}
+}
+
+func (a *App) handleAutomationSessionByID(w http.ResponseWriter, r *http.Request) {
+	requestID := uuid.New().String()
+	if !a.requireAutomationAuth(w, r, requestID) {
+		return
+	}
+
+	sessionID := strings.TrimPrefix(r.URL.Path, "/api/v1/automation/sessions/")
+	if sessionID == "" {
+		a.writeAutomationJSON(w, http.StatusBadRequest, requestID, nil, &automationErrorPayload{
+			Code:    "invalid_request",
+			Message: "缺少 session_id",
+		})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		a.automationMu.RLock()
+		session, ok := a.automationSessions[sessionID]
+		var snapshot AutomationSession
+		if ok {
+			snapshot = *session
+		}
+		a.automationMu.RUnlock()
+		if !ok {
+			a.writeAutomationJSON(w, http.StatusNotFound, requestID, nil, &automationErrorPayload{
+				Code:    "not_found",
+				Message: "自动化会话不存在",
+			})
+			return
+		}
+		a.writeAutomationJSON(w, http.StatusOK, requestID, snapshot, nil)
+	case http.MethodDelete:
+		if err := a.StopAutomationSession(sessionID); err != nil {
+			a.writeAutomationJSON(w, http.StatusBadRequest, requestID, nil, &automationErrorPayload{
+				Code:    "stop_failed",
+				Message: err.Error(),
+			})
+			return
+		}
+		a.writeAutomationJSON(w, http.StatusOK, requestID, map[string]string{"session_id": sessionID, "status": "stopping"}, nil)
+	default:
+		a.writeAutomationJSON(w, http.StatusMethodNotAllowed, requestID, nil, &automationErrorPayload{
+			Code:    "method_not_allowed",
+			Message: "仅支持 GET 或 DELETE",
+		})
+	}
+}
+
+func (a *App) handleAutomationRotateToken(w http.ResponseWriter, r *http.Request) {
+	requestID := uuid.New().String()
+	if r.Method != http.MethodPost {
+		a.writeAutomationJSON(w, http.StatusMethodNotAllowed, requestID, nil, &automationErrorPayload{
+			Code:    "method_not_allowed",
+			Message: "仅支持 POST",
+		})
+		return
+	}
+	if !a.requireAutomationAuth(w, r, requestID) {
+		return
+	}
+
+	token, err := a.RotateAutomationToken()
+	if err != nil {
+		a.writeAutomationJSON(w, http.StatusInternalServerError, requestID, nil, &automationErrorPayload{
+			Code:    "rotate_failed",
+			Message: err.Error(),
+		})
+		return
+	}
+	a.writeAutomationJSON(w, http.StatusOK, requestID, map[string]string{"token": token}, nil)
 }
 
 // GetStartupURL 返回程序启动时携带的 URL 参数
@@ -982,77 +1515,253 @@ func (a *App) TestProxy(proxyStr string) (string, error) {
 	return fmt.Sprintf("状态码: %d", resp.StatusCode), nil
 }
 
-// LaunchBrowser 启动指定的浏览器环境
-func (a *App) LaunchBrowser(profileID string, startURL string) error {
-	var profile BrowserProfile
-	found := false
+func (a *App) getProfileByID(profileID string) (BrowserProfile, error) {
 	for _, p := range a.profiles {
 		if p.ID == profileID {
-			profile = p
-			found = true
-			break
+			return p, nil
 		}
 	}
-	if !found {
-		return fmt.Errorf("环境不存在")
-	}
+	return BrowserProfile{}, fmt.Errorf("环境不存在")
+}
 
+func (a *App) prepareProfileLaunch(profile BrowserProfile) (string, string, error) {
 	exePath, err := a.getCamoufoxPath()
 	if err != nil {
-		return err
+		return "", "", err
 	}
 
-	userDataDir := filepath.Join(a.getDataDir(), "profiles", profileID)
-	os.MkdirAll(userDataDir, 0755)
+	userDataDir := filepath.Join(a.getDataDir(), "profiles", profile.ID)
+	if err := os.MkdirAll(userDataDir, 0755); err != nil {
+		return "", "", err
+	}
 
-	// 配置代理
 	if err := a.setupProxy(userDataDir, profile.Proxy); err != nil {
 		fmt.Printf("配置代理失败: %v\n", err)
 	}
 
-	// 配置并注入 Cookie
 	if err := a.setupCookies(userDataDir, profile.Cookies); err != nil {
 		fmt.Printf("注入 Cookie 失败: %v\n", err)
 	}
 
-	// 生成并注入全量指纹配置
+	return exePath, userDataDir, nil
+}
+
+func (a *App) buildCamoufoxEnv(profile BrowserProfile) []string {
 	config := a.generateFingerprintConfig(profile)
-	a.injectCamouConfig(config)
+	data, _ := json.Marshal(config)
 
-	// 备选：个别关键 UA 也可以直接通过 CAMOU_UA 注入
-	os.Setenv("CAMOU_UA", profile.UA)
+	baseEnv := os.Environ()
+	filtered := make([]string, 0, len(baseEnv)+8)
+	for _, entry := range baseEnv {
+		upper := strings.ToUpper(entry)
+		if strings.HasPrefix(upper, "CAMOU_CONFIG_") || strings.HasPrefix(upper, "CAMOU_UA=") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
 
+	configStr := string(data)
+	chunkSize := 2000
+	for i := 0; i < len(configStr); i += chunkSize {
+		end := i + chunkSize
+		if end > len(configStr) {
+			end = len(configStr)
+		}
+		envName := fmt.Sprintf("CAMOU_CONFIG_%d", (i/chunkSize)+1)
+		filtered = append(filtered, envName+"="+configStr[i:end])
+	}
+
+	filtered = append(filtered, "CAMOU_UA="+profile.UA)
+	return filtered
+}
+
+func (a *App) buildBrowserArgs(userDataDir, startURL string, debugPort int) []string {
 	args := []string{
 		"--profile", userDataDir,
 		"--no-remote",
 	}
 
-	if startURL == "" {
-		startURL = profile.StartURL
+	if debugPort > 0 {
+		args = append(args, "--remote-debugging-port", fmt.Sprintf("%d", debugPort))
 	}
 
 	if startURL != "" {
 		args = append(args, startURL)
 	}
 
-	cmd := exec.Command(exePath, args...)
+	return args
+}
+
+func (a *App) monitorBrowserExit(cmd *exec.Cmd, profile BrowserProfile, sessionID string) {
+	go func() {
+		_ = cmd.Wait()
+
+		if sessionID != "" {
+			a.updateAutomationSession(sessionID, func(session *AutomationSession) {
+				session.Status = "stopped"
+			})
+		}
+
+		a.Log("info", fmt.Sprintf("环境 [%s] 已关闭，正在自动存档 Cookie 状态...", profile.Name))
+		if err := a.SyncCookies(profile.ID); err != nil {
+			a.Log("warn", fmt.Sprintf("自动存档失败: %v", err))
+		}
+
+		if sessionID != "" {
+			a.automationMu.Lock()
+			delete(a.automationSessions, sessionID)
+			delete(a.automationRuntimes, sessionID)
+			a.automationMu.Unlock()
+		}
+	}()
+}
+
+// LaunchBrowser 启动指定的浏览器环境
+func (a *App) LaunchBrowser(profileID string, startURL string) error {
+	profile, err := a.getProfileByID(profileID)
+	if err != nil {
+		return err
+	}
+
+	exePath, userDataDir, err := a.prepareProfileLaunch(profile)
+	if err != nil {
+		return err
+	}
+
+	if startURL == "" {
+		startURL = profile.StartURL
+	}
+
+	cmd := exec.Command(exePath, a.buildBrowserArgs(userDataDir, startURL, 0)...)
+	cmd.Env = a.buildCamoufoxEnv(profile)
 	err = cmd.Start()
 	if err != nil {
 		a.Log("error", fmt.Sprintf("进程启动失败: %v", err))
 	} else {
 		a.Log("info", fmt.Sprintf("环境 [%s] 已成功启动 (PID: %d)", profile.Name, cmd.Process.Pid))
-
-		// 异步监听浏览器进程结束并自动归档 Cookie
-		go func() {
-			cmd.Wait()
-			a.Log("info", fmt.Sprintf("环境 [%s] 已关闭，正在自动存档 Cookie 状态...", profile.Name))
-			err := a.SyncCookies(profileID)
-			if err != nil {
-				a.Log("warn", fmt.Sprintf("自动存档失败: %v", err))
-			}
-		}()
+		a.monitorBrowserExit(cmd, profile, "")
 	}
 	return err
+}
+
+func (a *App) StartAutomationSession(profileID string, startURL string) (AutomationSession, error) {
+	if !a.automationConfig.Enabled {
+		return AutomationSession{}, fmt.Errorf("本地自动化 API 当前未启用")
+	}
+
+	normalizedStartURL, err := normalizeStartURL(startURL)
+	if err != nil {
+		return AutomationSession{}, err
+	}
+
+	profile, err := a.getProfileByID(profileID)
+	if err != nil {
+		return AutomationSession{}, err
+	}
+
+	a.automationMu.Lock()
+	if existing := a.findAutomationSessionByProfileLocked(profileID); existing != nil {
+		snapshot := *existing
+		a.automationMu.Unlock()
+		return snapshot, nil
+	}
+	a.automationMu.Unlock()
+
+	exePath, userDataDir, err := a.prepareProfileLaunch(profile)
+	if err != nil {
+		return AutomationSession{}, err
+	}
+
+	debugPort, err := reserveTCPPort()
+	if err != nil {
+		return AutomationSession{}, fmt.Errorf("分配自动化端口失败: %v", err)
+	}
+
+	if normalizedStartURL == "" {
+		normalizedStartURL = profile.StartURL
+	}
+
+	session := &AutomationSession{
+		SessionID:   uuid.New().String(),
+		ProfileID:   profile.ID,
+		ProfileName: profile.Name,
+		StartedAt:   time.Now().Unix(),
+		Status:      "starting",
+		DebugPort:   debugPort,
+		ConnectURL:  buildAutomationConnectURL(debugPort),
+		Protocol:    "bidi",
+		StartURL:    normalizedStartURL,
+	}
+
+	cmd := exec.Command(exePath, a.buildBrowserArgs(userDataDir, normalizedStartURL, debugPort)...)
+	cmd.Env = a.buildCamoufoxEnv(profile)
+
+	stdout, stdoutErr := cmd.StdoutPipe()
+	if stdoutErr != nil {
+		return AutomationSession{}, fmt.Errorf("创建自动化输出管道失败: %v", stdoutErr)
+	}
+	stderr, stderrErr := cmd.StderrPipe()
+	if stderrErr != nil {
+		return AutomationSession{}, fmt.Errorf("创建自动化错误管道失败: %v", stderrErr)
+	}
+
+	a.automationMu.Lock()
+	if existing := a.findAutomationSessionByProfileLocked(profileID); existing != nil {
+		snapshot := *existing
+		a.automationMu.Unlock()
+		return snapshot, nil
+	}
+	a.automationSessions[session.SessionID] = session
+	a.automationRuntimes[session.SessionID] = &automationSessionRuntime{
+		cmd:     cmd,
+		profile: profile,
+	}
+	a.automationMu.Unlock()
+
+	if err := cmd.Start(); err != nil {
+		a.automationMu.Lock()
+		delete(a.automationSessions, session.SessionID)
+		delete(a.automationRuntimes, session.SessionID)
+		a.automationMu.Unlock()
+		return AutomationSession{}, fmt.Errorf("自动化浏览器启动失败: %v", err)
+	}
+
+	go a.watchAutomationPipe(session.SessionID, "stdout", stdout)
+	go a.watchAutomationPipe(session.SessionID, "stderr", stderr)
+
+	a.updateAutomationSession(session.SessionID, func(current *AutomationSession) {
+		current.PID = cmd.Process.Pid
+		current.Status = "running"
+	})
+
+	a.Log("info", fmt.Sprintf("自动化会话 [%s] 已启动，环境 [%s]，BiDi: %s", session.SessionID, profile.Name, session.ConnectURL))
+	a.monitorBrowserExit(cmd, profile, session.SessionID)
+
+	a.automationMu.RLock()
+	snapshot := a.copyAutomationSession(a.automationSessions[session.SessionID])
+	a.automationMu.RUnlock()
+	return snapshot, nil
+}
+
+func (a *App) StopAutomationSession(sessionID string) error {
+	a.automationMu.Lock()
+	runtime, ok := a.automationRuntimes[sessionID]
+	session := a.automationSessions[sessionID]
+	if ok && session != nil {
+		session.Status = "stopping"
+	}
+	a.automationMu.Unlock()
+
+	if !ok || runtime == nil || runtime.cmd == nil || runtime.cmd.Process == nil {
+		return fmt.Errorf("自动化会话不存在")
+	}
+
+	if err := runtime.cmd.Process.Kill(); err != nil {
+		return fmt.Errorf("关闭自动化会话失败: %v", err)
+	}
+
+	a.Log("info", fmt.Sprintf("已发送停止指令到自动化会话 [%s]", sessionID))
+	return nil
 }
 
 // GetProfiles 获取所有环境列表
@@ -1258,6 +1967,69 @@ func (a *App) GetStorageDirectory() string {
 // GetStorageMode 返回当前存储模式: localappdata 或 portable
 func (a *App) GetStorageMode() string {
 	return a.getStorageModeLabel()
+}
+
+func (a *App) GetAutomationInfo() AutomationInfo {
+	return a.buildAutomationInfo()
+}
+
+func (a *App) GetAutomationSessions() []AutomationSession {
+	return a.listAutomationSessions()
+}
+
+func (a *App) GetAutomationToken() string {
+	return a.automationConfig.APIToken
+}
+
+func (a *App) SetAutomationEnabled(enabled bool) error {
+	if enabled == a.automationConfig.Enabled {
+		return nil
+	}
+
+	if !enabled && a.automationSessionCount() > 0 {
+		return fmt.Errorf("请先停止当前自动化会话，再关闭自动化控制台")
+	}
+
+	a.automationConfig.Enabled = enabled
+
+	if enabled {
+		if err := a.startAutomationServer(); err != nil {
+			a.automationConfig.Enabled = false
+			_ = a.saveAutomationConfig()
+			return fmt.Errorf("启用自动化控制台失败: %v", err)
+		}
+		if err := a.saveAutomationConfig(); err != nil {
+			return err
+		}
+		a.Log("info", fmt.Sprintf("本地自动化控制台已启用: http://%s", a.automationListenAddr))
+		return nil
+	}
+
+	if err := a.stopAutomationServer(); err != nil {
+		a.automationConfig.Enabled = true
+		_ = a.saveAutomationConfig()
+		return fmt.Errorf("停用自动化控制台失败: %v", err)
+	}
+	if err := a.saveAutomationConfig(); err != nil {
+		return err
+	}
+	a.Log("info", "本地自动化控制台已停用。")
+	return nil
+}
+
+func (a *App) RotateAutomationToken() (string, error) {
+	token, err := generateAutomationToken()
+	if err != nil {
+		return "", err
+	}
+
+	a.automationConfig.APIToken = token
+	if err := a.saveAutomationConfig(); err != nil {
+		return "", err
+	}
+
+	a.Log("info", "本地自动化 API token 已轮换，请同步更新脚本中的 Bearer token。")
+	return token, nil
 }
 
 // UnregisterAsDefaultBrowser 清理当前程序添加的浏览器注册表项
