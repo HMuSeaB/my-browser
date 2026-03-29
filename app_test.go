@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func TestNormalizeStartURL(t *testing.T) {
@@ -359,6 +362,252 @@ func TestStartAutomationSessionReturnsExistingSessionForSameProfile(t *testing.T
 	}
 }
 
+func TestSendBiDiCommandIgnoresAsyncMessages(t *testing.T) {
+	server, wsURL := newBiDiTestServer(t, func(conn *websocket.Conn) {
+		defer conn.Close()
+
+		var command bidiCommandRequest
+		if err := conn.ReadJSON(&command); err != nil {
+			t.Errorf("read command: %v", err)
+			return
+		}
+
+		if err := conn.WriteJSON(map[string]interface{}{
+			"method": "log.entryAdded",
+			"params": map[string]interface{}{"text": "noise"},
+		}); err != nil {
+			t.Errorf("write async event: %v", err)
+			return
+		}
+		if err := conn.WriteJSON(map[string]interface{}{
+			"id":     command.ID + 99,
+			"result": map[string]interface{}{"ignored": true},
+		}); err != nil {
+			t.Errorf("write mismatched response: %v", err)
+			return
+		}
+		if err := conn.WriteJSON(map[string]interface{}{
+			"id":     command.ID,
+			"result": map[string]interface{}{"ok": true},
+		}); err != nil {
+			t.Errorf("write matching response: %v", err)
+		}
+	})
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	result, err := sendBiDiCommand(conn, 1, "test.command", map[string]interface{}{"hello": "world"}, 2*time.Second)
+	if err != nil {
+		t.Fatalf("sendBiDiCommand returned error: %v", err)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if payload["ok"] != true {
+		t.Fatalf("unexpected result payload: %+v", payload)
+	}
+}
+
+func TestSendBiDiCommandTimesOut(t *testing.T) {
+	server, wsURL := newBiDiTestServer(t, func(conn *websocket.Conn) {
+		defer conn.Close()
+		var command bidiCommandRequest
+		if err := conn.ReadJSON(&command); err != nil {
+			t.Errorf("read command: %v", err)
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	})
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	_, err = sendBiDiCommand(conn, 1, "test.command", nil, 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestStartAutomationSessionReusesExistingSessionAndNavigatesRequestedURL(t *testing.T) {
+	navigateCalls := make(chan map[string]interface{}, 1)
+	server, wsURL := newBiDiTestServer(t, func(conn *websocket.Conn) {
+		defer conn.Close()
+
+		for {
+			var command bidiCommandRequest
+			if err := conn.ReadJSON(&command); err != nil {
+				return
+			}
+
+			switch command.Method {
+			case "session.new":
+				_ = conn.WriteJSON(map[string]interface{}{
+					"id": command.ID,
+					"error": map[string]interface{}{
+						"error":   "session already active",
+						"message": "session already active",
+					},
+				})
+			case "browsingContext.getTree":
+				_ = conn.WriteJSON(map[string]interface{}{
+					"method": "network.beforeRequestSent",
+					"params": map[string]interface{}{"context": "root-1"},
+				})
+				_ = conn.WriteJSON(map[string]interface{}{
+					"id": command.ID,
+					"result": map[string]interface{}{
+						"contexts": []map[string]interface{}{
+							{"context": "root-1"},
+						},
+					},
+				})
+			case "browsingContext.navigate":
+				navigateCalls <- command.Params.(map[string]interface{})
+				_ = conn.WriteJSON(map[string]interface{}{
+					"id":     command.ID,
+					"result": map[string]interface{}{"navigation": "nav-1"},
+				})
+				return
+			}
+		}
+	})
+	defer server.Close()
+
+	app := &App{
+		profiles: []BrowserProfile{
+			{ID: "profile-1", Name: "Profile A", StartURL: "https://default.example"},
+		},
+		automationConfig: AutomationConfig{
+			Enabled: true,
+		},
+		automationSessions: map[string]*AutomationSession{
+			"session-1": {
+				SessionID:   "session-1",
+				ProfileID:   "profile-1",
+				ProfileName: "Profile A",
+				Status:      "running",
+				DebugPort:   45678,
+				ConnectURL:  wsURL,
+				Protocol:    "bidi",
+			},
+		},
+		automationRuntimes: map[string]*automationSessionRuntime{},
+	}
+
+	session, err := app.StartAutomationSession("profile-1", "chatgpt.com")
+	if err != nil {
+		t.Fatalf("StartAutomationSession returned error: %v", err)
+	}
+	if session.SessionID != "session-1" {
+		t.Fatalf("expected reused session, got %q", session.SessionID)
+	}
+	if len(app.automationSessions) != 1 {
+		t.Fatalf("expected only one automation session, got %d", len(app.automationSessions))
+	}
+
+	select {
+	case navigate := <-navigateCalls:
+		if got := navigate["url"]; got != "https://chatgpt.com" {
+			t.Fatalf("navigate url = %v, want https://chatgpt.com", got)
+		}
+		if got := navigate["wait"]; got != "none" {
+			t.Fatalf("navigate wait = %v, want none", got)
+		}
+		if got := navigate["context"]; got != "root-1" {
+			t.Fatalf("navigate context = %v, want root-1", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected navigate call")
+	}
+}
+
+func TestStartAutomationSessionUsesProfileDefaultURLForExistingSession(t *testing.T) {
+	navigateCalls := make(chan map[string]interface{}, 1)
+	server, wsURL := newBiDiTestServer(t, func(conn *websocket.Conn) {
+		defer conn.Close()
+
+		for {
+			var command bidiCommandRequest
+			if err := conn.ReadJSON(&command); err != nil {
+				return
+			}
+
+			switch command.Method {
+			case "session.new":
+				_ = conn.WriteJSON(map[string]interface{}{
+					"id":     command.ID,
+					"result": map[string]interface{}{},
+				})
+			case "browsingContext.getTree":
+				_ = conn.WriteJSON(map[string]interface{}{
+					"id": command.ID,
+					"result": map[string]interface{}{
+						"contexts": []map[string]interface{}{
+							{"context": "root-1"},
+						},
+					},
+				})
+			case "browsingContext.navigate":
+				navigateCalls <- command.Params.(map[string]interface{})
+				_ = conn.WriteJSON(map[string]interface{}{
+					"id":     command.ID,
+					"result": map[string]interface{}{"navigation": "nav-1"},
+				})
+				return
+			}
+		}
+	})
+	defer server.Close()
+
+	app := &App{
+		profiles: []BrowserProfile{
+			{ID: "profile-1", Name: "Profile A", StartURL: "google.com"},
+		},
+		automationConfig: AutomationConfig{
+			Enabled: true,
+		},
+		automationSessions: map[string]*AutomationSession{
+			"session-1": {
+				SessionID:   "session-1",
+				ProfileID:   "profile-1",
+				ProfileName: "Profile A",
+				Status:      "running",
+				DebugPort:   45678,
+				ConnectURL:  wsURL,
+				Protocol:    "bidi",
+			},
+		},
+		automationRuntimes: map[string]*automationSessionRuntime{},
+	}
+
+	if _, err := app.StartAutomationSession("profile-1", ""); err != nil {
+		t.Fatalf("StartAutomationSession returned error: %v", err)
+	}
+
+	select {
+	case navigate := <-navigateCalls:
+		if got := navigate["url"]; got != "https://google.com" {
+			t.Fatalf("navigate url = %v, want https://google.com", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected navigate call")
+	}
+}
+
 func TestSetAutomationEnabledRequiresNoActiveSessionsWhenDisabling(t *testing.T) {
 	app := &App{
 		dataDir: t.TempDir(),
@@ -384,6 +633,28 @@ func TestSetAutomationEnabledRequiresNoActiveSessionsWhenDisabling(t *testing.T)
 	if !app.automationConfig.Enabled {
 		t.Fatal("expected automation to remain enabled after failure")
 	}
+}
+
+func newBiDiTestServer(t *testing.T, handler func(*websocket.Conn)) (*httptest.Server, string) {
+	t.Helper()
+
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/session" {
+			http.NotFound(w, r)
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		handler(conn)
+	}))
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/session"
+	return server, wsURL
 }
 
 func assertFileContent(t *testing.T, path, want string) {

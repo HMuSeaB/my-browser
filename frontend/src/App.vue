@@ -297,6 +297,7 @@ const handleStartAutomation = async (profileID = selectedAutomationProfileId.val
   if (!automationInfo.value.enabled) return alert('请先启用自动化控制台')
   if (!profileID) return alert('请先选择一个环境')
   const existingSession = getAutomationSessionForProfile(profileID)
+  const effectiveTargetURL = (startURL || '').trim() || getProfileById(profileID)?.start_url || ''
   automationLoading.value = true
   try {
     const session = await StartAutomationSession(profileID, startURL)
@@ -304,9 +305,17 @@ const handleStartAutomation = async (profileID = selectedAutomationProfileId.val
     automationStartURL.value = ''
     await fetchAutomationState()
     if (existingSession) {
-      alert(`该环境已存在活动自动化会话，已直接复用\nBiDi 地址: ${session.connect_url}`)
+      if (effectiveTargetURL) {
+        alert(`已复用自动化会话并打开链接\nBiDi 地址: ${session.connect_url}`)
+      } else {
+        alert(`该环境已存在活动自动化会话，已直接复用\nBiDi 地址: ${session.connect_url}`)
+      }
     } else {
-      alert(`自动化会话已启动\nBiDi 地址: ${session.connect_url}`)
+      if (effectiveTargetURL) {
+        alert(`已启动自动化会话并打开链接\nBiDi 地址: ${session.connect_url}`)
+      } else {
+        alert(`自动化会话已启动\nBiDi 地址: ${session.connect_url}`)
+      }
     }
   } catch (err) {
     alert('自动化启动失败: ' + err)
@@ -351,6 +360,10 @@ const handleToggleAutomation = async () => {
 
 const getAutomationSessionForProfile = (profileID) => {
   return automationSessions.value.find((session) => session.profile_id === profileID)
+}
+
+const getProfileById = (profileID) => {
+  return profiles.value.find((profile) => profile.id === profileID)
 }
 
 const shortId = (value) => {
@@ -875,7 +888,7 @@ onUnmounted(() => {
 
               <section class="automation-card glass">
                 <div class="automation-card-head">
-                  <h3>快捷启动</h3>
+                  <h3>一键打开</h3>
                   <span class="status-chip subtle">BiDi</span>
                 </div>
                 <div class="field">
@@ -886,12 +899,12 @@ onUnmounted(() => {
                   </select>
                 </div>
                 <div class="field">
-                  <label>启动地址（可选）</label>
+                  <label>打开链接（可选）</label>
                   <input v-model="automationStartURL" placeholder="例如 https://example.com" />
-                  <span class="hint">留空则沿用该环境的默认标签页。</span>
+                  <span class="hint">留空则沿用该环境的默认标签页；如果该环境已在运行，会直接复用当前会话并跳转。</span>
                 </div>
                 <button @click="handleStartAutomation()" class="btn-solid" :disabled="automationLoading || !automationInfo.enabled">
-                  {{ automationLoading ? '启动中...' : '启动自动化会话' }}
+                  {{ automationLoading ? '打开中...' : '在环境中打开链接' }}
                 </button>
                 <span class="hint" v-if="!automationInfo.enabled">请先在上方启用自动化控制台。</span>
               </section>

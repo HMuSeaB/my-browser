@@ -66,6 +66,7 @@ wails build
 - MyBrowser Pro 内置了本地开发者 API，可在 `自动化控制台` 侧边栏中查看实际监听地址、Bearer token、当前活动会话以及 BiDi 连接地址。
 - API 只监听 `127.0.0.1`，默认启用 Bearer token 鉴权；普通“启动环境”不会暴露调试口，只有“自动化启动”才会创建 BiDi 会话。
 - v1 首发只承诺 **Firefox / Camoufox 的 WebDriver BiDi 接入**，不承诺 Chromium CDP 或 Playwright `connect_over_cdp` 兼容。
+- 日常简单操作可以直接在自动化控制台里选环境、贴链接、一键打开；这条 UI 链路与下方 Python 示例走的是同一套 BiDi 导航流程。Python 示例则保留给批量、多步、联动脚本等高级场景。
 
 ### 常用接口
 

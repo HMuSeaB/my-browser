@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
 	_ "modernc.org/sqlite"
@@ -130,6 +131,31 @@ type automationResponse struct {
 	Data      interface{}             `json:"data,omitempty"`
 	Error     *automationErrorPayload `json:"error,omitempty"`
 	RequestID string                  `json:"request_id"`
+}
+
+type bidiCommandRequest struct {
+	ID     int64       `json:"id"`
+	Method string      `json:"method"`
+	Params interface{} `json:"params"`
+}
+
+type bidiCommandResponse struct {
+	ID     int64           `json:"id,omitempty"`
+	Method string          `json:"method,omitempty"`
+	Params json.RawMessage `json:"params,omitempty"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *bidiError      `json:"error,omitempty"`
+}
+
+type bidiError struct {
+	Error   string `json:"error"`
+	Message string `json:"message"`
+}
+
+type bidiGetTreeResult struct {
+	Contexts []struct {
+		Context string `json:"context"`
+	} `json:"contexts"`
 }
 
 var bidiEndpointPattern = regexp.MustCompile(`ws://(?:127\.0\.0\.1|localhost):\d+(?:/[^\s"]*)?`)
@@ -628,6 +654,235 @@ func (a *App) updateAutomationSession(sessionID string, updater func(*Automation
 	updater(session)
 }
 
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (a *App) dialAutomationSession(connectURL string, timeout time.Duration) (*websocket.Conn, error) {
+	deadline := time.Now().Add(timeout)
+	dialer := websocket.Dialer{
+		HandshakeTimeout: minDuration(3*time.Second, timeout),
+	}
+
+	var lastErr error
+	for time.Now().Before(deadline) {
+		conn, _, err := dialer.Dial(connectURL, nil)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("连接超时")
+	}
+	return nil, lastErr
+}
+
+func sendBiDiCommand(conn *websocket.Conn, commandID int64, method string, params interface{}, timeout time.Duration) (json.RawMessage, error) {
+	if params == nil {
+		params = map[string]interface{}{}
+	}
+
+	if err := conn.SetWriteDeadline(time.Now().Add(minDuration(5*time.Second, timeout))); err != nil {
+		return nil, err
+	}
+	if err := conn.WriteJSON(bidiCommandRequest{
+		ID:     commandID,
+		Method: method,
+		Params: params,
+	}); err != nil {
+		return nil, err
+	}
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+
+		if err := conn.SetReadDeadline(time.Now().Add(minDuration(time.Second, remaining))); err != nil {
+			return nil, err
+		}
+
+		var response bidiCommandResponse
+		if err := conn.ReadJSON(&response); err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, err
+		}
+
+		if response.ID != commandID {
+			continue
+		}
+		if response.Error != nil {
+			message := strings.TrimSpace(response.Error.Message)
+			if message == "" {
+				message = strings.TrimSpace(response.Error.Error)
+			}
+			if message == "" {
+				message = "unknown bidi error"
+			}
+			return nil, fmt.Errorf("%s failed: %s", method, message)
+		}
+		return response.Result, nil
+	}
+
+	return nil, fmt.Errorf("%s timed out after %s", method, timeout)
+}
+
+func extractRootContextID(raw json.RawMessage) (string, error) {
+	var result bidiGetTreeResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return "", fmt.Errorf("解析 browsingContext.getTree 结果失败: %w", err)
+	}
+	if len(result.Contexts) == 0 || strings.TrimSpace(result.Contexts[0].Context) == "" {
+		return "", fmt.Errorf("未找到可用的浏览上下文")
+	}
+	return result.Contexts[0].Context, nil
+}
+
+func (a *App) navigateAutomationSession(session AutomationSession, targetURL string) error {
+	if strings.TrimSpace(targetURL) == "" {
+		return nil
+	}
+
+	a.automationMu.RLock()
+	if current := a.automationSessions[session.SessionID]; current != nil {
+		session = *current
+	}
+	a.automationMu.RUnlock()
+
+	connectURL := strings.TrimSpace(session.ConnectURL)
+	if connectURL == "" {
+		connectURL = buildAutomationConnectURL(session.DebugPort)
+	}
+	connectURL = normalizeBidiConnectURL(connectURL)
+
+	conn, err := a.dialAutomationSession(connectURL, 12*time.Second)
+	if err != nil {
+		return fmt.Errorf("连接自动化会话失败: %w", err)
+	}
+	defer conn.Close()
+
+	commandID := int64(1)
+	if _, err := sendBiDiCommand(conn, commandID, "session.new", map[string]interface{}{
+		"capabilities": map[string]interface{}{
+			"alwaysMatch": map[string]interface{}{},
+		},
+	}, 5*time.Second); err != nil {
+		a.Log("warn", fmt.Sprintf("自动化会话 [%s] session.new 兼容性提示: %v", session.SessionID, err))
+	}
+	commandID++
+
+	treeResult, err := sendBiDiCommand(conn, commandID, "browsingContext.getTree", map[string]interface{}{}, 8*time.Second)
+	if err != nil {
+		return err
+	}
+	commandID++
+
+	contextID, err := extractRootContextID(treeResult)
+	if err != nil {
+		return err
+	}
+
+	if _, err := sendBiDiCommand(conn, commandID, "browsingContext.navigate", map[string]interface{}{
+		"context": contextID,
+		"url":     targetURL,
+		"wait":    "none",
+	}, 8*time.Second); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (a *App) ensureAutomationSession(profile BrowserProfile) (AutomationSession, bool, error) {
+	a.automationMu.Lock()
+	if existing := a.findAutomationSessionByProfileLocked(profile.ID); existing != nil {
+		snapshot := *existing
+		a.automationMu.Unlock()
+		return snapshot, true, nil
+	}
+	a.automationMu.Unlock()
+
+	exePath, userDataDir, err := a.prepareProfileLaunch(profile)
+	if err != nil {
+		return AutomationSession{}, false, err
+	}
+
+	debugPort, err := reserveTCPPort()
+	if err != nil {
+		return AutomationSession{}, false, fmt.Errorf("分配自动化端口失败: %v", err)
+	}
+
+	session := &AutomationSession{
+		SessionID:   uuid.New().String(),
+		ProfileID:   profile.ID,
+		ProfileName: profile.Name,
+		StartedAt:   time.Now().Unix(),
+		Status:      "starting",
+		DebugPort:   debugPort,
+		ConnectURL:  buildAutomationConnectURL(debugPort),
+		Protocol:    "bidi",
+	}
+
+	cmd := exec.Command(exePath, a.buildBrowserArgs(userDataDir, "", debugPort)...)
+	cmd.Env = a.buildCamoufoxEnv(profile)
+
+	stdout, stdoutErr := cmd.StdoutPipe()
+	if stdoutErr != nil {
+		return AutomationSession{}, false, fmt.Errorf("创建自动化输出管道失败: %v", stdoutErr)
+	}
+	stderr, stderrErr := cmd.StderrPipe()
+	if stderrErr != nil {
+		return AutomationSession{}, false, fmt.Errorf("创建自动化错误管道失败: %v", stderrErr)
+	}
+
+	a.automationMu.Lock()
+	if existing := a.findAutomationSessionByProfileLocked(profile.ID); existing != nil {
+		snapshot := *existing
+		a.automationMu.Unlock()
+		return snapshot, true, nil
+	}
+	a.automationSessions[session.SessionID] = session
+	a.automationRuntimes[session.SessionID] = &automationSessionRuntime{
+		cmd:     cmd,
+		profile: profile,
+	}
+	a.automationMu.Unlock()
+
+	if err := cmd.Start(); err != nil {
+		a.automationMu.Lock()
+		delete(a.automationSessions, session.SessionID)
+		delete(a.automationRuntimes, session.SessionID)
+		a.automationMu.Unlock()
+		return AutomationSession{}, false, fmt.Errorf("自动化浏览器启动失败: %v", err)
+	}
+
+	go a.watchAutomationPipe(session.SessionID, "stdout", stdout)
+	go a.watchAutomationPipe(session.SessionID, "stderr", stderr)
+
+	a.updateAutomationSession(session.SessionID, func(current *AutomationSession) {
+		current.PID = cmd.Process.Pid
+		current.Status = "running"
+	})
+
+	a.Log("info", fmt.Sprintf("自动化会话 [%s] 已启动，环境 [%s]，BiDi: %s", session.SessionID, profile.Name, session.ConnectURL))
+	a.monitorBrowserExit(cmd, profile, session.SessionID)
+
+	a.automationMu.RLock()
+	snapshot := a.copyAutomationSession(a.automationSessions[session.SessionID])
+	a.automationMu.RUnlock()
+	return snapshot, false, nil
+}
+
 func (a *App) watchAutomationPipe(sessionID, stream string, reader io.ReadCloser) {
 	defer reader.Close()
 
@@ -724,8 +979,10 @@ func (a *App) Log(level, message string) {
 		"level":   level,
 		"message": message,
 	}
-	// 发送事件到前端
-	runtime.EventsEmit(a.ctx, "log_update", logEntry)
+	if a.ctx != nil {
+		// 发送事件到前端
+		runtime.EventsEmit(a.ctx, "log_update", logEntry)
+	}
 }
 
 func normalizeStartURL(raw string) (string, error) {
@@ -1659,83 +1916,39 @@ func (a *App) StartAutomationSession(profileID string, startURL string) (Automat
 		return AutomationSession{}, err
 	}
 
-	a.automationMu.Lock()
-	if existing := a.findAutomationSessionByProfileLocked(profileID); existing != nil {
-		snapshot := *existing
-		a.automationMu.Unlock()
-		return snapshot, nil
+	targetURL := normalizedStartURL
+	if targetURL == "" {
+		targetURL = profile.StartURL
 	}
-	a.automationMu.Unlock()
+	if targetURL != "" {
+		targetURL, err = normalizeStartURL(targetURL)
+		if err != nil {
+			return AutomationSession{}, err
+		}
+	}
 
-	exePath, userDataDir, err := a.prepareProfileLaunch(profile)
+	session, reused, err := a.ensureAutomationSession(profile)
 	if err != nil {
 		return AutomationSession{}, err
 	}
 
-	debugPort, err := reserveTCPPort()
-	if err != nil {
-		return AutomationSession{}, fmt.Errorf("分配自动化端口失败: %v", err)
+	if targetURL != "" {
+		if err := a.navigateAutomationSession(session, targetURL); err != nil {
+			a.updateAutomationSession(session.SessionID, func(current *AutomationSession) {
+				current.LastError = err.Error()
+			})
+			return AutomationSession{}, fmt.Errorf("打开链接失败: %w", err)
+		}
+		a.updateAutomationSession(session.SessionID, func(current *AutomationSession) {
+			current.StartURL = targetURL
+			current.LastError = ""
+		})
+		if reused {
+			a.Log("info", fmt.Sprintf("已复用自动化会话 [%s] 并打开链接: %s", session.SessionID, targetURL))
+		} else {
+			a.Log("info", fmt.Sprintf("自动化会话 [%s] 已完成首跳: %s", session.SessionID, targetURL))
+		}
 	}
-
-	if normalizedStartURL == "" {
-		normalizedStartURL = profile.StartURL
-	}
-
-	session := &AutomationSession{
-		SessionID:   uuid.New().String(),
-		ProfileID:   profile.ID,
-		ProfileName: profile.Name,
-		StartedAt:   time.Now().Unix(),
-		Status:      "starting",
-		DebugPort:   debugPort,
-		ConnectURL:  buildAutomationConnectURL(debugPort),
-		Protocol:    "bidi",
-		StartURL:    normalizedStartURL,
-	}
-
-	cmd := exec.Command(exePath, a.buildBrowserArgs(userDataDir, normalizedStartURL, debugPort)...)
-	cmd.Env = a.buildCamoufoxEnv(profile)
-
-	stdout, stdoutErr := cmd.StdoutPipe()
-	if stdoutErr != nil {
-		return AutomationSession{}, fmt.Errorf("创建自动化输出管道失败: %v", stdoutErr)
-	}
-	stderr, stderrErr := cmd.StderrPipe()
-	if stderrErr != nil {
-		return AutomationSession{}, fmt.Errorf("创建自动化错误管道失败: %v", stderrErr)
-	}
-
-	a.automationMu.Lock()
-	if existing := a.findAutomationSessionByProfileLocked(profileID); existing != nil {
-		snapshot := *existing
-		a.automationMu.Unlock()
-		return snapshot, nil
-	}
-	a.automationSessions[session.SessionID] = session
-	a.automationRuntimes[session.SessionID] = &automationSessionRuntime{
-		cmd:     cmd,
-		profile: profile,
-	}
-	a.automationMu.Unlock()
-
-	if err := cmd.Start(); err != nil {
-		a.automationMu.Lock()
-		delete(a.automationSessions, session.SessionID)
-		delete(a.automationRuntimes, session.SessionID)
-		a.automationMu.Unlock()
-		return AutomationSession{}, fmt.Errorf("自动化浏览器启动失败: %v", err)
-	}
-
-	go a.watchAutomationPipe(session.SessionID, "stdout", stdout)
-	go a.watchAutomationPipe(session.SessionID, "stderr", stderr)
-
-	a.updateAutomationSession(session.SessionID, func(current *AutomationSession) {
-		current.PID = cmd.Process.Pid
-		current.Status = "running"
-	})
-
-	a.Log("info", fmt.Sprintf("自动化会话 [%s] 已启动，环境 [%s]，BiDi: %s", session.SessionID, profile.Name, session.ConnectURL))
-	a.monitorBrowserExit(cmd, profile, session.SessionID)
 
 	a.automationMu.RLock()
 	snapshot := a.copyAutomationSession(a.automationSessions[session.SessionID])
