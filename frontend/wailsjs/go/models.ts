@@ -59,6 +59,7 @@ export namespace main {
 	export class BrowserProfile {
 	    id: string;
 	    name: string;
+	    category: string;
 	    proxy: string;
 	    start_url: string;
 	    ua: string;
@@ -74,6 +75,7 @@ export namespace main {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
 	        this.name = source["name"];
+	        this.category = source["category"];
 	        this.proxy = source["proxy"];
 	        this.start_url = source["start_url"];
 	        this.ua = source["ua"];

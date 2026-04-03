@@ -69,6 +69,69 @@ func TestUpdateProfileNormalizesStartURL(t *testing.T) {
 	}
 }
 
+func TestNormalizeCategory(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "empty", input: "", want: ""},
+		{name: "trim spaces", input: "  工作  ", want: "工作"},
+		{name: "collapse whitespace", input: "AI   Tools", want: "AI Tools"},
+		{name: "preserve chinese words", input: "  电商   账号  ", want: "电商 账号"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeCategory(tt.input); got != tt.want {
+				t.Fatalf("normalizeCategory(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCreateProfileNormalizesCategory(t *testing.T) {
+	app := &App{
+		profiles: []BrowserProfile{},
+		dataDir:  t.TempDir(),
+	}
+
+	profile, err := app.CreateProfile("分类环境", "", "", "chatgpt.com", "  AI   Tools ")
+	if err != nil {
+		t.Fatalf("CreateProfile returned error: %v", err)
+	}
+
+	if profile.Category != "AI Tools" {
+		t.Fatalf("Category = %q, want %q", profile.Category, "AI Tools")
+	}
+	if got := app.profiles[0].Category; got != "AI Tools" {
+		t.Fatalf("saved category = %q, want %q", got, "AI Tools")
+	}
+}
+
+func TestUpdateProfileNormalizesCategory(t *testing.T) {
+	app := &App{
+		profiles: []BrowserProfile{
+			{ID: "profile-1", Name: "Test"},
+		},
+		dataDir: t.TempDir(),
+	}
+
+	err := app.UpdateProfile(BrowserProfile{
+		ID:       "profile-1",
+		Name:     "Test",
+		StartURL: "chatgpt.com",
+		Category: "  电商   测试 ",
+	})
+	if err != nil {
+		t.Fatalf("UpdateProfile returned error: %v", err)
+	}
+
+	if got := app.profiles[0].Category; got != "电商 测试" {
+		t.Fatalf("Category = %q, want %q", got, "电商 测试")
+	}
+}
+
 func TestInitializeStorageUsesLocalAppData(t *testing.T) {
 	localAppData := t.TempDir()
 	t.Setenv("LOCALAPPDATA", localAppData)

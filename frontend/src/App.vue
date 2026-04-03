@@ -117,6 +117,7 @@ const presetColors = [
 
 const newProfile = ref({
   name: '',
+  category: '',
   proxyType: 'socks5://',
   proxyAddr: '127.0.0.1:7891', // Clash 默认 SOCKS 端口
   startUrl: '',
@@ -167,9 +168,23 @@ const tokenPreview = computed(() => {
 })
 
 const normalizedSearchQuery = computed(() => searchQuery.value.trim().toLowerCase())
+const normalizeCategoryLabel = (value = '') => value.trim().replace(/\s+/g, ' ')
+
+const existingProfileCategories = computed(() => {
+  const categoryMap = new Map()
+  profiles.value.forEach((profile) => {
+    const category = normalizeCategoryLabel(profile.category || '')
+    if (!category) return
+    categoryMap.set(category, (categoryMap.get(category) || 0) + 1)
+  })
+
+  return Array.from(categoryMap.entries())
+    .sort((a, b) => a[0].localeCompare(b[0], 'zh-CN'))
+    .map(([label, count]) => ({ label, count }))
+})
 
 const searchPlaceholder = computed(() => {
-  if (currentView.value === 'profiles') return '搜索环境名称、ID、代理或默认页...'
+  if (currentView.value === 'profiles') return '搜索环境名称、ID、分类、代理或默认页...'
   if (currentView.value === 'proxies') return '搜索代理名称、地址或状态...'
   if (currentView.value === 'automation') return '搜索会话名称、ID、端口或连接地址...'
   if (currentView.value === 'logs') return '搜索日志级别或内容...'
@@ -184,6 +199,7 @@ const filteredProfiles = computed(() => {
       profile.name,
       profile.id,
       shortId(profile.id),
+      profile.category || '未分类',
       profile.proxy || '直连',
       profile.start_url || '新标签页',
       session?.connect_url || '',
@@ -194,17 +210,16 @@ const filteredProfiles = computed(() => {
 
 const profileCategoryTabs = computed(() => {
   const profileCount = profiles.value.length
-  const automatedCount = profiles.value.filter((profile) => !!getAutomationSessionForProfile(profile.id)).length
-  const proxiedCount = profiles.value.filter((profile) => !!profile.proxy).length
-  const directCount = profiles.value.filter((profile) => !profile.proxy).length
-  const recentCount = Math.min(profileCount, 6)
+  const uncategorizedCount = profiles.value.filter((profile) => !normalizeCategoryLabel(profile.category || '')).length
 
   return [
     { key: 'all', label: '全部环境', count: profileCount },
-    { key: 'recent', label: '最近创建', count: recentCount },
-    { key: 'automation', label: '自动化中', count: automatedCount },
-    { key: 'proxy', label: '已配置代理', count: proxiedCount },
-    { key: 'direct', label: '直连环境', count: directCount },
+    { key: 'uncategorized', label: '未分类', count: uncategorizedCount },
+    ...existingProfileCategories.value.map((category) => ({
+      key: `category:${category.label}`,
+      label: category.label,
+      count: category.count,
+    })),
   ]
 })
 
@@ -218,24 +233,23 @@ const filteredProfileCards = computed(() => {
     return (b.create_at || 0) - (a.create_at || 0)
   })
 
-  if (activeProfileCategory.value === 'recent') {
-    return source.slice(0, 6)
+  if (activeProfileCategory.value === 'uncategorized') {
+    return source.filter((profile) => !normalizeCategoryLabel(profile.category || ''))
   }
 
-  if (activeProfileCategory.value === 'automation') {
-    return source.filter((profile) => !!getAutomationSessionForProfile(profile.id))
-  }
-
-  if (activeProfileCategory.value === 'proxy') {
-    return source.filter((profile) => !!profile.proxy)
-  }
-
-  if (activeProfileCategory.value === 'direct') {
-    return source.filter((profile) => !profile.proxy)
+  if (activeProfileCategory.value.startsWith('category:')) {
+    const targetCategory = activeProfileCategory.value.replace('category:', '')
+    return source.filter((profile) => normalizeCategoryLabel(profile.category || '') === targetCategory)
   }
 
   return source
 })
+
+watch(profileCategoryTabs, (tabs) => {
+  if (!tabs.some((tab) => tab.key === activeProfileCategory.value)) {
+    activeProfileCategory.value = 'all'
+  }
+}, { deep: true })
 
 const detailProfile = computed(() => {
   if (!profileDetailId.value) return null
@@ -323,6 +337,7 @@ const currentViewStats = computed(() => {
     return [
       { label: '环境', value: `${filteredProfileCards.value.length}/${profiles.value.length}` },
       { label: '自动化中', value: String(runningAutomationCount.value) },
+      { label: '分类', value: String(existingProfileCategories.value.length) },
     ]
   }
 
@@ -765,7 +780,7 @@ const handleCreate = async () => {
   }
   const fullProxy = newProfile.value.proxyAddr ? newProfile.value.proxyType + newProfile.value.proxyAddr : ''
   try {
-    await CreateProfile(newProfile.value.name, fullProxy, newProfile.value.ua, newProfile.value.startUrl)
+    await CreateProfile(newProfile.value.name, fullProxy, newProfile.value.ua, newProfile.value.startUrl, newProfile.value.category)
     showCreateModal.value = false
     resetNewProfile()
     await fetchProfiles()
@@ -779,6 +794,7 @@ const resetNewProfile = () => {
     selectedProxyId.value = ''
     newProfile.value = { 
         name: '', 
+        category: '',
         proxyType: 'socks5://', 
         proxyAddr: '127.0.0.1:7891', 
         startUrl: '',
@@ -1195,8 +1211,8 @@ onUnmounted(() => {
                     <div>
                       <div class="profile-title-row">
                         <h3>{{ p.name }}</h3>
+                        <span v-if="p.category" class="status-chip subtle">{{ p.category }}</span>
                         <span v-if="getAutomationSessionForProfile(p.id)" class="status-chip online subtle">自动化中</span>
-                        <span v-else class="status-chip subtle">{{ p.proxy ? '已配置代理' : '直连' }}</span>
                       </div>
                       <div class="profile-id-row">
                         <code>{{ shortId(p.id) }}</code>
@@ -1213,6 +1229,10 @@ onUnmounted(() => {
                     <div class="profile-meta-line">
                       <span class="label">默认页</span>
                       <span class="start-url">{{ p.start_url || '新标签页' }}</span>
+                    </div>
+                    <div class="profile-meta-line">
+                      <span class="label">分类</span>
+                      <strong>{{ p.category || '未分类' }}</strong>
                     </div>
                     <div v-if="getAutomationSessionForProfile(p.id)" class="profile-meta-line meta-wide">
                       <span class="label">BiDi</span>
@@ -1261,6 +1281,10 @@ onUnmounted(() => {
                 <div class="detail-card">
                   <span class="label">默认页</span>
                   <strong>{{ detailProfile.start_url || '新标签页' }}</strong>
+                </div>
+                <div class="detail-card">
+                  <span class="label">分类</span>
+                  <strong>{{ detailProfile.category || '未分类' }}</strong>
                 </div>
                 <div class="detail-card">
                   <span class="label">状态</span>
@@ -1494,6 +1518,11 @@ onUnmounted(() => {
               <input v-model="newProfile.name" placeholder="设置一个好记的名字" />
             </div>
             <div class="field">
+              <label>环境分类（可选）</label>
+              <input v-model="newProfile.category" list="profile-category-options" placeholder="例如 工作 / 购物 / AI" />
+              <span class="hint">可自由输入；留空则归入未分类。已有分类会自动出现在上方筛选栏。</span>
+            </div>
+            <div class="field">
               <label>代理设置</label>
               <select v-model="selectedProxyId" @change="onProxySelect" style="margin-bottom: 8px;">
                 <option value="">-- 自定义手填地址 --</option>
@@ -1533,6 +1562,11 @@ onUnmounted(() => {
             <div class="field">
                <label>环境名称</label>
                <input v-model="editingProfile.name" />
+            </div>
+            <div class="field">
+              <label>环境分类（可选）</label>
+              <input v-model="editingProfile.category" list="profile-category-options" placeholder="例如 工作 / 购物 / AI" />
+              <span class="hint">可自由输入；留空后会自动归入未分类。</span>
             </div>
             <div class="field">
               <label>代理地址 (完整格式)</label>
@@ -1582,6 +1616,10 @@ onUnmounted(() => {
         </div>
       </div>
     </Transition>
+
+    <datalist id="profile-category-options">
+      <option v-for="category in existingProfileCategories" :key="category.label" :value="category.label"></option>
+    </datalist>
   </div>
 </template>
 

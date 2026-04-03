@@ -34,6 +34,7 @@ import (
 type BrowserProfile struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
+	Category string `json:"category"`
 	Proxy    string `json:"proxy"`     // 格式: type://user:pass@host:port
 	StartURL string `json:"start_url"` // 默认启动页
 	UA       string `json:"ua"`        // User-Agent
@@ -85,6 +86,7 @@ type AutomationSession struct {
 type AutomationProfileSummary struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
+	Category string `json:"category"`
 	Proxy    string `json:"proxy"`
 	StartURL string `json:"start_url"`
 	Platform string `json:"platform"`
@@ -1006,8 +1008,12 @@ func normalizeStartURL(raw string) (string, error) {
 	return parsed.String(), nil
 }
 
+func normalizeCategory(raw string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(raw)), " ")
+}
+
 // CreateProfile 创建新环境
-func (a *App) CreateProfile(name, proxy, ua, startURL string) (BrowserProfile, error) {
+func (a *App) CreateProfile(name, proxy, ua, startURL, category string) (BrowserProfile, error) {
 	normalizedStartURL, err := normalizeStartURL(startURL)
 	if err != nil {
 		return BrowserProfile{}, err
@@ -1016,6 +1022,7 @@ func (a *App) CreateProfile(name, proxy, ua, startURL string) (BrowserProfile, e
 	newProfile := BrowserProfile{
 		ID:       uuid.New().String(),
 		Name:     name,
+		Category: normalizeCategory(category),
 		Proxy:    proxy,
 		StartURL: normalizedStartURL,
 		UA:       ua,
@@ -1046,6 +1053,7 @@ func (a *App) UpdateProfile(updated BrowserProfile) error {
 		return err
 	}
 	updated.StartURL = normalizedStartURL
+	updated.Category = normalizeCategory(updated.Category)
 
 	for i, p := range a.profiles {
 		if p.ID == updated.ID {
@@ -1246,6 +1254,7 @@ func (a *App) handleAutomationProfiles(w http.ResponseWriter, r *http.Request) {
 		summaries = append(summaries, AutomationProfileSummary{
 			ID:       profile.ID,
 			Name:     profile.Name,
+			Category: profile.Category,
 			Proxy:    profile.Proxy,
 			StartURL: profile.StartURL,
 			Platform: profile.Platform,
