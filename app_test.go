@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/zip"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -106,6 +108,25 @@ func TestCreateProfileNormalizesCategory(t *testing.T) {
 	}
 	if got := app.profiles[0].Category; got != "AI Tools" {
 		t.Fatalf("saved category = %q, want %q", got, "AI Tools")
+	}
+}
+
+func TestCreateProfileAllowsEmptyCategoryAndStartURL(t *testing.T) {
+	app := &App{
+		profiles: []BrowserProfile{},
+		dataDir:  t.TempDir(),
+	}
+
+	profile, err := app.CreateProfile("空白环境", "", "", "", "   ")
+	if err != nil {
+		t.Fatalf("CreateProfile returned error: %v", err)
+	}
+
+	if profile.Category != "" {
+		t.Fatalf("Category = %q, want empty", profile.Category)
+	}
+	if profile.StartURL != "" {
+		t.Fatalf("StartURL = %q, want empty", profile.StartURL)
 	}
 }
 
@@ -671,6 +692,56 @@ func TestStartAutomationSessionUsesProfileDefaultURLForExistingSession(t *testin
 	}
 }
 
+func TestHandleAutomationProfilesReturnsCategories(t *testing.T) {
+	app := &App{
+		profiles: []BrowserProfile{
+			{ID: "profile-1", Name: "Profile A", Category: "工作", StartURL: "https://chatgpt.com", Platform: "Windows"},
+			{ID: "profile-2", Name: "Profile B", Category: "", StartURL: "", Platform: "Windows"},
+		},
+		automationConfig: AutomationConfig{
+			Enabled:       true,
+			APIListenAddr: "127.0.0.1:9090",
+			APIToken:      "secret-token",
+		},
+		automationSessions: map[string]*AutomationSession{},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/automation/profiles", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	rec := httptest.NewRecorder()
+
+	app.handleAutomationProfiles(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var payload automationResponse
+	if err := json.NewDecoder(strings.NewReader(rec.Body.String())).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	dataBytes, err := json.Marshal(payload.Data)
+	if err != nil {
+		t.Fatalf("marshal nested data: %v", err)
+	}
+
+	var summaries []AutomationProfileSummary
+	if err := json.Unmarshal(dataBytes, &summaries); err != nil {
+		t.Fatalf("unmarshal summaries: %v", err)
+	}
+
+	if len(summaries) != 2 {
+		t.Fatalf("summary count = %d, want 2", len(summaries))
+	}
+	if summaries[0].Category != "工作" {
+		t.Fatalf("first category = %q, want 工作", summaries[0].Category)
+	}
+	if summaries[1].Category != "" {
+		t.Fatalf("second category = %q, want empty", summaries[1].Category)
+	}
+}
+
 func TestSetAutomationEnabledRequiresNoActiveSessionsWhenDisabling(t *testing.T) {
 	app := &App{
 		dataDir: t.TempDir(),
@@ -695,6 +766,256 @@ func TestSetAutomationEnabledRequiresNoActiveSessionsWhenDisabling(t *testing.T)
 	}
 	if !app.automationConfig.Enabled {
 		t.Fatal("expected automation to remain enabled after failure")
+	}
+}
+
+func TestSetAutomationEnabledPersistsConfig(t *testing.T) {
+	app := &App{
+		dataDir: t.TempDir(),
+		automationConfig: AutomationConfig{
+			Enabled:       false,
+			APIListenAddr: "127.0.0.1:0",
+			APIToken:      "secret-token",
+		},
+		automationSessions: map[string]*AutomationSession{},
+		automationRuntimes: map[string]*automationSessionRuntime{},
+	}
+
+	if err := app.SetAutomationEnabled(true); err != nil {
+		t.Fatalf("SetAutomationEnabled(true) returned error: %v", err)
+	}
+	defer func() {
+		_ = app.SetAutomationEnabled(false)
+	}()
+
+	if !app.automationConfig.Enabled {
+		t.Fatal("expected automation to be enabled")
+	}
+	if app.automationListenAddr == "" {
+		t.Fatal("expected automation listen address to be assigned")
+	}
+
+	assertAutomationConfig(t, filepath.Join(app.dataDir, "automation.json"), true)
+
+	if err := app.SetAutomationEnabled(false); err != nil {
+		t.Fatalf("SetAutomationEnabled(false) returned error: %v", err)
+	}
+	if app.automationListenAddr != "" {
+		t.Fatalf("expected listen address to be cleared, got %q", app.automationListenAddr)
+	}
+
+	assertAutomationConfig(t, filepath.Join(app.dataDir, "automation.json"), false)
+}
+
+func TestSyncCookiesReadsCookieDatabase(t *testing.T) {
+	app := &App{
+		profiles: []BrowserProfile{
+			{ID: "profile-1", Name: "Test Profile", Cookies: "[]"},
+		},
+		dataDir: t.TempDir(),
+	}
+
+	dbPath := filepath.Join(app.dataDir, "profiles", "profile-1", "cookies.sqlite")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		t.Fatalf("create profile dir: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`CREATE TABLE moz_cookies (
+		name TEXT,
+		value TEXT,
+		host TEXT,
+		path TEXT,
+		expiry INTEGER,
+		isSecure INTEGER,
+		isHttpOnly INTEGER
+	)`); err != nil {
+		t.Fatalf("create moz_cookies: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO moz_cookies (name, value, host, path, expiry, isSecure, isHttpOnly) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"sessionid", "abc123", ".chatgpt.com", "/", 1735689600, 1, 1,
+	); err != nil {
+		t.Fatalf("insert cookie: %v", err)
+	}
+
+	if err := app.SyncCookies("profile-1"); err != nil {
+		t.Fatalf("SyncCookies returned error: %v", err)
+	}
+
+	var cookies []map[string]interface{}
+	if err := json.Unmarshal([]byte(app.profiles[0].Cookies), &cookies); err != nil {
+		t.Fatalf("unmarshal synced cookies: %v", err)
+	}
+	if len(cookies) != 1 {
+		t.Fatalf("cookie count = %d, want 1", len(cookies))
+	}
+	if cookies[0]["name"] != "sessionid" {
+		t.Fatalf("cookie name = %v, want sessionid", cookies[0]["name"])
+	}
+}
+
+func TestSyncCookiesReturnsErrorWhenDatabaseMissing(t *testing.T) {
+	app := &App{
+		profiles: []BrowserProfile{
+			{ID: "profile-1", Name: "Test Profile", Cookies: "[]"},
+		},
+		dataDir: t.TempDir(),
+	}
+
+	err := app.SyncCookies("profile-1")
+	if err == nil {
+		t.Fatal("expected missing cookie database to return error")
+	}
+	if !strings.Contains(err.Error(), "尚未生成 Cookie 数据库") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestExportProfileBundleIncludesMetadataAndFiles(t *testing.T) {
+	app := &App{
+		dataDir: t.TempDir(),
+	}
+	profile := BrowserProfile{
+		ID:       "profile-1",
+		Name:     "Export Target",
+		Category: "工作",
+		StartURL: "https://chatgpt.com",
+		Cookies:  "[]",
+		Platform: "Windows",
+	}
+
+	userDataDir := filepath.Join(app.dataDir, "profiles", profile.ID)
+	if err := os.MkdirAll(filepath.Join(userDataDir, "sessionstore-backups"), 0755); err != nil {
+		t.Fatalf("create export profile dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(userDataDir, "cookies.sqlite"), []byte("sqlite"), 0644); err != nil {
+		t.Fatalf("write cookies.sqlite: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(userDataDir, "sessionstore-backups", "recovery.json"), []byte(`{"ok":true}`), 0644); err != nil {
+		t.Fatalf("write recovery.json: %v", err)
+	}
+
+	bundlePath := filepath.Join(t.TempDir(), "profile.mbp")
+	if err := app.exportProfileBundle(profile, bundlePath); err != nil {
+		t.Fatalf("exportProfileBundle returned error: %v", err)
+	}
+
+	zipReader, err := zip.OpenReader(bundlePath)
+	if err != nil {
+		t.Fatalf("open bundle zip: %v", err)
+	}
+	defer zipReader.Close()
+
+	var names []string
+	var metadata BrowserProfile
+	for _, file := range zipReader.File {
+		names = append(names, file.Name)
+		if file.Name != "metadata.json" {
+			continue
+		}
+		reader, err := file.Open()
+		if err != nil {
+			t.Fatalf("open metadata: %v", err)
+		}
+		if err := json.NewDecoder(reader).Decode(&metadata); err != nil {
+			reader.Close()
+			t.Fatalf("decode metadata: %v", err)
+		}
+		reader.Close()
+	}
+
+	if metadata.Category != "工作" {
+		t.Fatalf("metadata category = %q, want 工作", metadata.Category)
+	}
+	if metadata.StartURL != "https://chatgpt.com" {
+		t.Fatalf("metadata start_url = %q, want https://chatgpt.com", metadata.StartURL)
+	}
+	if !containsString(names, "data/cookies.sqlite") {
+		t.Fatalf("expected cookies.sqlite in bundle, got %v", names)
+	}
+	if !containsString(names, "data/sessionstore-backups/recovery.json") {
+		t.Fatalf("expected nested data file in bundle, got %v", names)
+	}
+}
+
+func TestImportProfileBundleDefaultsMissingFieldsAndUniqName(t *testing.T) {
+	app := &App{
+		dataDir: t.TempDir(),
+		profiles: []BrowserProfile{
+			{ID: "existing", Name: "导入环境"},
+		},
+	}
+
+	bundlePath := filepath.Join(t.TempDir(), "import.mbp")
+	err := writeTestProfileBundle(bundlePath, BrowserProfile{
+		ID:       "legacy-profile",
+		Name:     "导入环境",
+		Category: "  AI   Tools ",
+		StartURL: "chatgpt.com",
+	}, map[string]string{
+		"data/cookies.sqlite": "sqlite",
+	})
+	if err != nil {
+		t.Fatalf("write test bundle: %v", err)
+	}
+
+	profile, err := app.importProfileBundle(bundlePath)
+	if err != nil {
+		t.Fatalf("importProfileBundle returned error: %v", err)
+	}
+
+	if profile.ID == "legacy-profile" {
+		t.Fatal("expected imported profile to receive a new ID")
+	}
+	if profile.Name != "导入环境 (1)" {
+		t.Fatalf("Name = %q, want 导入环境 (1)", profile.Name)
+	}
+	if profile.Category != "AI Tools" {
+		t.Fatalf("Category = %q, want AI Tools", profile.Category)
+	}
+	if profile.StartURL != "https://chatgpt.com" {
+		t.Fatalf("StartURL = %q, want https://chatgpt.com", profile.StartURL)
+	}
+	if profile.Platform != "Windows" {
+		t.Fatalf("Platform = %q, want Windows", profile.Platform)
+	}
+	if profile.Cookies != "[]" {
+		t.Fatalf("Cookies = %q, want []", profile.Cookies)
+	}
+
+	extractedPath := filepath.Join(app.dataDir, "profiles", profile.ID, "cookies.sqlite")
+	assertFileContent(t, extractedPath, "sqlite")
+}
+
+func TestImportProfileBundleRejectsPathTraversal(t *testing.T) {
+	app := &App{
+		dataDir:  t.TempDir(),
+		profiles: []BrowserProfile{},
+		proxies:  []ProxyEntry{},
+	}
+
+	bundlePath := filepath.Join(t.TempDir(), "evil.mbp")
+	err := writeTestProfileBundle(bundlePath, BrowserProfile{
+		ID:   "legacy-profile",
+		Name: "恶意环境",
+	}, map[string]string{
+		"data/../escape.txt": "oops",
+	})
+	if err != nil {
+		t.Fatalf("write malicious bundle: %v", err)
+	}
+
+	_, err = app.importProfileBundle(bundlePath)
+	if err == nil {
+		t.Fatal("expected path traversal bundle to be rejected")
+	}
+	if !strings.Contains(err.Error(), "非法路径") && !strings.Contains(err.Error(), "越界路径") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -730,4 +1051,69 @@ func assertFileContent(t *testing.T, path, want string) {
 	if string(got) != want {
 		t.Fatalf("content mismatch for %s: got %q want %q", path, string(got), want)
 	}
+}
+
+func assertAutomationConfig(t *testing.T, path string, wantEnabled bool) {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read automation config: %v", err)
+	}
+
+	var config AutomationConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		t.Fatalf("unmarshal automation config: %v", err)
+	}
+
+	if config.Enabled != wantEnabled {
+		t.Fatalf("automation enabled = %v, want %v", config.Enabled, wantEnabled)
+	}
+	if strings.TrimSpace(config.APIToken) == "" {
+		t.Fatal("expected automation token to be persisted")
+	}
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+func writeTestProfileBundle(path string, metadata BrowserProfile, files map[string]string) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	writer := zip.NewWriter(file)
+	defer writer.Close()
+
+	metadataFile, err := writer.Create("metadata.json")
+	if err != nil {
+		return err
+	}
+	metadataBytes, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	if _, err := metadataFile.Write(metadataBytes); err != nil {
+		return err
+	}
+
+	for name, content := range files {
+		entry, err := writer.Create(name)
+		if err != nil {
+			return err
+		}
+		if _, err := entry.Write([]byte(content)); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

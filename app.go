@@ -1012,6 +1012,28 @@ func normalizeCategory(raw string) string {
 	return strings.Join(strings.Fields(strings.TrimSpace(raw)), " ")
 }
 
+func normalizeImportedProfile(profile BrowserProfile) (BrowserProfile, error) {
+	profile.Category = normalizeCategory(profile.Category)
+
+	normalizedStartURL, err := normalizeStartURL(profile.StartURL)
+	if err != nil {
+		return BrowserProfile{}, err
+	}
+	profile.StartURL = normalizedStartURL
+
+	if strings.TrimSpace(profile.Name) == "" {
+		profile.Name = "导入环境"
+	}
+	if strings.TrimSpace(profile.Platform) == "" {
+		profile.Platform = "Windows"
+	}
+	if strings.TrimSpace(profile.Cookies) == "" {
+		profile.Cookies = "[]"
+	}
+
+	return profile, nil
+}
+
 // CreateProfile 创建新环境
 func (a *App) CreateProfile(name, proxy, ua, startURL, category string) (BrowserProfile, error) {
 	normalizedStartURL, err := normalizeStartURL(startURL)
@@ -1790,6 +1812,217 @@ func (a *App) getProfileByID(profileID string) (BrowserProfile, error) {
 	return BrowserProfile{}, fmt.Errorf("环境不存在")
 }
 
+func (a *App) ensureUniqueProfileName(baseName string) string {
+	if strings.TrimSpace(baseName) == "" {
+		baseName = "导入环境"
+	}
+
+	newName := baseName
+	counter := 1
+	for {
+		exists := false
+		for _, profile := range a.profiles {
+			if profile.Name == newName {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			return newName
+		}
+		newName = fmt.Sprintf("%s (%d)", baseName, counter)
+		counter++
+	}
+}
+
+func safeJoinProfileDataPath(baseDir, archivePath string) (string, error) {
+	cleaned := filepath.Clean(strings.TrimPrefix(archivePath, "data/"))
+	if cleaned == "." || cleaned == "" {
+		return "", nil
+	}
+
+	if filepath.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("环境包包含非法路径: %s", archivePath)
+	}
+
+	targetPath := filepath.Join(baseDir, cleaned)
+	rel, err := filepath.Rel(baseDir, targetPath)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("环境包包含越界路径: %s", archivePath)
+	}
+
+	return targetPath, nil
+}
+
+func (a *App) exportProfileBundle(profile BrowserProfile, targetPath string) error {
+	newZipFile, err := os.Create(targetPath)
+	if err != nil {
+		return err
+	}
+	defer newZipFile.Close()
+
+	zipWriter := zip.NewWriter(newZipFile)
+	defer zipWriter.Close()
+
+	metaData, err := json.MarshalIndent(profile, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	metadataFile, err := zipWriter.Create("metadata.json")
+	if err != nil {
+		return err
+	}
+	if _, err := metadataFile.Write(metaData); err != nil {
+		return err
+	}
+
+	userDataDir := filepath.Join(a.getDataDir(), "profiles", profile.ID)
+	if _, err := os.Stat(userDataDir); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	return filepath.Walk(userDataDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(userDataDir, path)
+		if err != nil {
+			return err
+		}
+
+		archiveFile, err := zipWriter.Create(filepath.ToSlash(filepath.Join("data", relPath)))
+		if err != nil {
+			return err
+		}
+
+		srcFile, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer srcFile.Close()
+
+		_, err = io.Copy(archiveFile, srcFile)
+		return err
+	})
+}
+
+func (a *App) importProfileBundle(sourcePath string) (BrowserProfile, error) {
+	zipReader, err := zip.OpenReader(sourcePath)
+	if err != nil {
+		return BrowserProfile{}, err
+	}
+	defer zipReader.Close()
+
+	var (
+		profile       BrowserProfile
+		metadataFound bool
+	)
+
+	for _, file := range zipReader.File {
+		if file.Name != "metadata.json" {
+			continue
+		}
+
+		reader, err := file.Open()
+		if err != nil {
+			return BrowserProfile{}, err
+		}
+
+		content, err := io.ReadAll(reader)
+		reader.Close()
+		if err != nil {
+			return BrowserProfile{}, err
+		}
+		if err := json.Unmarshal(content, &profile); err != nil {
+			return BrowserProfile{}, fmt.Errorf("环境包元数据损坏: %w", err)
+		}
+
+		metadataFound = true
+		break
+	}
+
+	if !metadataFound || profile.ID == "" {
+		return BrowserProfile{}, fmt.Errorf("无效的环境包")
+	}
+
+	profile, err = normalizeImportedProfile(profile)
+	if err != nil {
+		return BrowserProfile{}, err
+	}
+
+	profile.ID = uuid.New().String()
+	profile.Name = a.ensureUniqueProfileName(profile.Name)
+	profile.CreateAt = time.Now().Unix()
+
+	newUserDataDir := filepath.Join(a.getDataDir(), "profiles", profile.ID)
+	if err := os.MkdirAll(newUserDataDir, 0755); err != nil {
+		return BrowserProfile{}, err
+	}
+
+	for _, file := range zipReader.File {
+		if !strings.HasPrefix(file.Name, "data/") {
+			continue
+		}
+
+		targetPath, err := safeJoinProfileDataPath(newUserDataDir, file.Name)
+		if err != nil {
+			return BrowserProfile{}, err
+		}
+		if targetPath == "" {
+			continue
+		}
+
+		if file.FileInfo().IsDir() {
+			if err := os.MkdirAll(targetPath, 0755); err != nil {
+				return BrowserProfile{}, err
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			return BrowserProfile{}, err
+		}
+
+		srcFile, err := file.Open()
+		if err != nil {
+			return BrowserProfile{}, err
+		}
+
+		dstFile, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
+		if err != nil {
+			srcFile.Close()
+			return BrowserProfile{}, err
+		}
+
+		_, copyErr := io.Copy(dstFile, srcFile)
+		closeErr := dstFile.Close()
+		srcFile.Close()
+		if copyErr != nil {
+			return BrowserProfile{}, copyErr
+		}
+		if closeErr != nil {
+			return BrowserProfile{}, closeErr
+		}
+	}
+
+	a.profiles = append(a.profiles, profile)
+	if err := a.saveProfiles(); err != nil {
+		return BrowserProfile{}, err
+	}
+
+	return profile, nil
+}
+
 func (a *App) prepareProfileLaunch(profile BrowserProfile) (string, string, error) {
 	exePath, err := a.getCamoufoxPath()
 	if err != nil {
@@ -2022,14 +2255,8 @@ func (a *App) ExportCookies(profileID string) error {
 
 // ExportProfile 将整个环境打包为 MBP 迁移文件
 func (a *App) ExportProfile(profileID string) error {
-	var profile *BrowserProfile
-	for i, p := range a.profiles {
-		if p.ID == profileID {
-			profile = &a.profiles[i]
-			break
-		}
-	}
-	if profile == nil {
+	profile, err := a.getProfileByID(profileID)
+	if err != nil {
 		return fmt.Errorf("环境不存在")
 	}
 
@@ -2044,40 +2271,9 @@ func (a *App) ExportProfile(profileID string) error {
 		return err
 	}
 
-	// 创建 ZIP 存档
-	newZipFile, err := os.Create(targetPath)
-	if err != nil {
+	if err := a.exportProfileBundle(profile, targetPath); err != nil {
 		return err
 	}
-	defer newZipFile.Close()
-
-	zipWriter := zip.NewWriter(newZipFile)
-	defer zipWriter.Close()
-
-	// 1. 写入元数据
-	metaData, _ := json.MarshalIndent(profile, "", "  ")
-	f, err := zipWriter.Create("metadata.json")
-	if err != nil {
-		return err
-	}
-	f.Write(metaData)
-
-	// 2. 写入物理文件 (profiles/<id>/*)
-	userDataDir := filepath.Join(a.getDataDir(), "profiles", profileID)
-	filepath.Walk(userDataDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			return nil
-		}
-		relPath, _ := filepath.Rel(userDataDir, path)
-		f, err := zipWriter.Create(filepath.Join("data", relPath))
-		if err != nil {
-			return err
-		}
-		srcFile, _ := os.Open(path)
-		defer srcFile.Close()
-		io.Copy(f, srcFile)
-		return nil
-	})
 
 	a.Log("info", fmt.Sprintf("环境 [%s] 已成功打包导出到: %s", profile.Name, targetPath))
 	return nil
@@ -2302,73 +2498,10 @@ func (a *App) ImportProfile() error {
 		return err
 	}
 
-	zipReader, err := zip.OpenReader(sourcePath)
+	profile, err := a.importProfileBundle(sourcePath)
 	if err != nil {
 		return err
 	}
-	defer zipReader.Close()
-
-	var profile BrowserProfile
-	// 1. 读取元数据
-	for _, f := range zipReader.File {
-		if f.Name == "metadata.json" {
-			rc, _ := f.Open()
-			content, _ := io.ReadAll(rc)
-			rc.Close()
-			json.Unmarshal(content, &profile)
-			break
-		}
-	}
-
-	if profile.ID == "" {
-		return fmt.Errorf("无效的环境包")
-	}
-
-	// 2. 生成新 ID 避免重复，并准备目录
-	newID := uuid.New().String()
-	profile.ID = newID
-
-	// 智能重命名逻辑：仅在名称冲突时添加编号
-	baseName := profile.Name
-	newName := baseName
-	counter := 1
-	for {
-		exists := false
-		for _, p := range a.profiles {
-			if p.Name == newName {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			break
-		}
-		newName = fmt.Sprintf("%s (%d)", baseName, counter)
-		counter++
-	}
-	profile.Name = newName
-	profile.CreateAt = time.Now().Unix()
-	newUserDataDir := filepath.Join(a.getDataDir(), "profiles", newID)
-	os.MkdirAll(newUserDataDir, 0755)
-
-	// 3. 解压物理文件
-	for _, f := range zipReader.File {
-		if strings.HasPrefix(f.Name, "data/") {
-			relPath := strings.TrimPrefix(f.Name, "data/")
-			targetPath := filepath.Join(newUserDataDir, relPath)
-			os.MkdirAll(filepath.Dir(targetPath), 0755)
-
-			dstFile, _ := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
-			rc, _ := f.Open()
-			io.Copy(dstFile, rc)
-			rc.Close()
-			dstFile.Close()
-		}
-	}
-
-	// 4. 加入列表并保存
-	a.profiles = append(a.profiles, profile)
-	a.saveProfiles()
 
 	a.Log("info", fmt.Sprintf("成功导入环境: %s", profile.Name))
 	return nil

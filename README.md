@@ -195,6 +195,15 @@ finally:
 
 - 同步示例文件： [examples/local_automation_bidi.py](examples/local_automation_bidi.py)
 
+## 🧪 维护与回归
+
+- 日常维护与发版前，默认执行这组校验命令：
+  - `go test ./...`
+  - `cd frontend && npm run build`
+  - `wails build -clean -f`
+- 默认 Windows 构建产物位于 `build/bin/my-browser.exe`
+- 桌面流程的手动检查项整理在： [docs/SMOKE_CHECKLIST.md](docs/SMOKE_CHECKLIST.md)
+
 ## 🔒 隐私声明
 本项目为纯本地开源工具。除非您手动配置了外部代理，否则所有流量和环境数据仅驻留在您的设备上。
 
