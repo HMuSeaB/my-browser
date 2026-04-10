@@ -742,6 +742,125 @@ func TestHandleAutomationProfilesReturnsCategories(t *testing.T) {
 	}
 }
 
+func TestWithAutomationCORSHandlesOptionsRequest(t *testing.T) {
+	app := &App{}
+	nextCalled := false
+	handler := app.withAutomationCORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/v1/automation/sessions", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	if nextCalled {
+		t.Fatal("expected preflight request to return before next handler")
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("allow-origin = %q, want *", got)
+	}
+}
+
+func TestHandleAutomationSessionsRejectsInvalidJSON(t *testing.T) {
+	app := &App{
+		automationConfig: AutomationConfig{
+			Enabled:       true,
+			APIListenAddr: "127.0.0.1:9090",
+			APIToken:      "secret-token",
+		},
+		automationSessions: map[string]*AutomationSession{},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/automation/sessions", strings.NewReader("{bad json"))
+	req.Header.Set("Authorization", "Bearer secret-token")
+	rec := httptest.NewRecorder()
+
+	app.handleAutomationSessions(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+
+	var payload automationResponse
+	if err := json.NewDecoder(strings.NewReader(rec.Body.String())).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Error == nil || payload.Error.Code != "invalid_request" {
+		t.Fatalf("unexpected payload: %+v", payload)
+	}
+}
+
+func TestHandleAutomationSessionsRejectsUnsupportedMethod(t *testing.T) {
+	app := &App{
+		automationConfig: AutomationConfig{
+			Enabled:       true,
+			APIListenAddr: "127.0.0.1:9090",
+			APIToken:      "secret-token",
+		},
+		automationSessions: map[string]*AutomationSession{},
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/automation/sessions", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	rec := httptest.NewRecorder()
+
+	app.handleAutomationSessions(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestHandleAutomationSessionByIDReturnsNotFound(t *testing.T) {
+	app := &App{
+		automationConfig: AutomationConfig{
+			Enabled:       true,
+			APIListenAddr: "127.0.0.1:9090",
+			APIToken:      "secret-token",
+		},
+		automationSessions: map[string]*AutomationSession{},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/automation/sessions/missing", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	rec := httptest.NewRecorder()
+
+	app.handleAutomationSessionByID(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestHandleAutomationRotateTokenReturnsNewToken(t *testing.T) {
+	app := &App{
+		dataDir: t.TempDir(),
+		automationConfig: AutomationConfig{
+			Enabled:       true,
+			APIListenAddr: "127.0.0.1:9090",
+			APIToken:      "old-token",
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/automation/token/rotate", nil)
+	req.Header.Set("Authorization", "Bearer old-token")
+	rec := httptest.NewRecorder()
+
+	app.handleAutomationRotateToken(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if app.automationConfig.APIToken == "old-token" {
+		t.Fatal("expected token to be rotated")
+	}
+}
+
 func TestSetAutomationEnabledRequiresNoActiveSessionsWhenDisabling(t *testing.T) {
 	app := &App{
 		dataDir: t.TempDir(),
