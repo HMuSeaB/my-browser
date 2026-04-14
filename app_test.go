@@ -305,6 +305,77 @@ func TestInitializeStorageFallsBackToLaterLegacyDirectory(t *testing.T) {
 	}
 }
 
+func TestAddProxyPersistsEntry(t *testing.T) {
+	app := &App{
+		dataDir:  t.TempDir(),
+		proxies:  []ProxyEntry{},
+		profiles: []BrowserProfile{},
+	}
+
+	entry, err := app.AddProxy("Clash", "socks5://127.0.0.1:7891")
+	if err != nil {
+		t.Fatalf("AddProxy returned error: %v", err)
+	}
+
+	if entry.Name != "Clash" {
+		t.Fatalf("entry name = %q, want Clash", entry.Name)
+	}
+	if len(app.proxies) != 1 {
+		t.Fatalf("proxy count = %d, want 1", len(app.proxies))
+	}
+
+	data, err := os.ReadFile(filepath.Join(app.dataDir, "proxies.json"))
+	if err != nil {
+		t.Fatalf("read proxies.json: %v", err)
+	}
+	if !strings.Contains(string(data), "socks5://127.0.0.1:7891") {
+		t.Fatalf("expected persisted proxy data, got %s", string(data))
+	}
+}
+
+func TestDeleteProxyRemovesEntry(t *testing.T) {
+	app := &App{
+		dataDir: t.TempDir(),
+		proxies: []ProxyEntry{
+			{ID: "proxy-1", Name: "Clash", Proxy: "http://127.0.0.1:7890"},
+		},
+	}
+
+	if err := app.DeleteProxy("proxy-1"); err != nil {
+		t.Fatalf("DeleteProxy returned error: %v", err)
+	}
+	if len(app.proxies) != 0 {
+		t.Fatalf("proxy count = %d, want 0", len(app.proxies))
+	}
+}
+
+func TestDeleteProxyReturnsErrorWhenMissing(t *testing.T) {
+	app := &App{
+		dataDir: t.TempDir(),
+		proxies: []ProxyEntry{},
+	}
+
+	err := app.DeleteProxy("missing")
+	if err == nil {
+		t.Fatal("expected missing proxy deletion to fail")
+	}
+	if !strings.Contains(err.Error(), "未找到代理") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestTestProxyEntryReturnsErrorWhenMissing(t *testing.T) {
+	app := &App{proxies: []ProxyEntry{}}
+
+	_, err := app.TestProxyEntry("missing")
+	if err == nil {
+		t.Fatal("expected missing proxy entry test to fail")
+	}
+	if !strings.Contains(err.Error(), "代理不存在") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestGenerateAutomationToken(t *testing.T) {
 	tokenA, err := generateAutomationToken()
 	if err != nil {
@@ -1140,6 +1211,49 @@ func TestSyncCookiesReadsCookieDatabase(t *testing.T) {
 	}
 }
 
+func TestSetupCookiesImportsFallbackFields(t *testing.T) {
+	app := &App{}
+	userDataDir := t.TempDir()
+
+	cookieJSON := `[{"key":"sid","value":"abc","host":".example.com","expiry":1735689600,"secure":true,"httpOnly":true}]`
+	if err := app.setupCookies(userDataDir, cookieJSON); err != nil {
+		t.Fatalf("setupCookies returned error: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", filepath.Join(userDataDir, "cookies.sqlite"))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+
+	var name, host string
+	var secure, httpOnly int
+	if err := db.QueryRow(`SELECT name, host, isSecure, isHttpOnly FROM moz_cookies LIMIT 1`).Scan(&name, &host, &secure, &httpOnly); err != nil {
+		t.Fatalf("query inserted cookie: %v", err)
+	}
+
+	if name != "sid" {
+		t.Fatalf("name = %q, want sid", name)
+	}
+	if host != ".example.com" {
+		t.Fatalf("host = %q, want .example.com", host)
+	}
+	if secure != 1 || httpOnly != 1 {
+		t.Fatalf("secure/httpOnly = %d/%d, want 1/1", secure, httpOnly)
+	}
+}
+
+func TestSetupCookiesRejectsInvalidJSON(t *testing.T) {
+	app := &App{}
+	err := app.setupCookies(t.TempDir(), "{bad json")
+	if err == nil {
+		t.Fatal("expected invalid cookie JSON to fail")
+	}
+	if !strings.Contains(err.Error(), "解析 Cookie JSON 失败") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestSyncCookiesReturnsErrorWhenDatabaseMissing(t *testing.T) {
 	app := &App{
 		profiles: []BrowserProfile{
@@ -1153,6 +1267,52 @@ func TestSyncCookiesReturnsErrorWhenDatabaseMissing(t *testing.T) {
 		t.Fatal("expected missing cookie database to return error")
 	}
 	if !strings.Contains(err.Error(), "尚未生成 Cookie 数据库") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestResetCookiesRemovesDatabaseAndSessionFiles(t *testing.T) {
+	app := &App{
+		profiles: []BrowserProfile{
+			{ID: "profile-1", Name: "Test Profile", Cookies: `[{"name":"sid"}]`},
+		},
+		dataDir: t.TempDir(),
+	}
+
+	userDataDir := filepath.Join(app.dataDir, "profiles", "profile-1")
+	if err := os.MkdirAll(filepath.Join(userDataDir, "sessionstore-backups"), 0755); err != nil {
+		t.Fatalf("create profile dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(userDataDir, "cookies.sqlite"), []byte("sqlite"), 0644); err != nil {
+		t.Fatalf("write cookies.sqlite: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(userDataDir, "sessionstore-backups", "recovery.json"), []byte("{}"), 0644); err != nil {
+		t.Fatalf("write recovery.json: %v", err)
+	}
+
+	if err := app.ResetCookies("profile-1"); err != nil {
+		t.Fatalf("ResetCookies returned error: %v", err)
+	}
+
+	if app.profiles[0].Cookies != "[]" {
+		t.Fatalf("cookies = %q, want []", app.profiles[0].Cookies)
+	}
+	if _, err := os.Stat(filepath.Join(userDataDir, "cookies.sqlite")); !os.IsNotExist(err) {
+		t.Fatalf("expected cookies.sqlite to be removed, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(userDataDir, "sessionstore-backups")); !os.IsNotExist(err) {
+		t.Fatalf("expected sessionstore-backups to be removed, got %v", err)
+	}
+}
+
+func TestResetCookiesReturnsErrorWhenProfileMissing(t *testing.T) {
+	app := &App{profiles: []BrowserProfile{}}
+
+	err := app.ResetCookies("missing")
+	if err == nil {
+		t.Fatal("expected missing profile reset to fail")
+	}
+	if !strings.Contains(err.Error(), "环境不存在") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
