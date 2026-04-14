@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -858,6 +859,167 @@ func TestHandleAutomationRotateTokenReturnsNewToken(t *testing.T) {
 	}
 	if app.automationConfig.APIToken == "old-token" {
 		t.Fatal("expected token to be rotated")
+	}
+}
+
+func TestOpenDataDirectoryCreatesDirectoryAndStartsExplorer(t *testing.T) {
+	app := &App{dataDir: filepath.Join(t.TempDir(), "MyBrowserData")}
+
+	originalStarter := startHiddenCommand
+	defer func() { startHiddenCommand = originalStarter }()
+
+	var gotName string
+	var gotArgs []string
+	startHiddenCommand = func(name string, args ...string) error {
+		gotName = name
+		gotArgs = append([]string{}, args...)
+		return nil
+	}
+
+	if err := app.OpenDataDirectory(); err != nil {
+		t.Fatalf("OpenDataDirectory returned error: %v", err)
+	}
+
+	if _, err := os.Stat(app.dataDir); err != nil {
+		t.Fatalf("expected data dir to exist: %v", err)
+	}
+	if gotName != "cmd" {
+		t.Fatalf("command name = %q, want cmd", gotName)
+	}
+	if len(gotArgs) != 4 || gotArgs[3] != app.dataDir {
+		t.Fatalf("unexpected command args: %v", gotArgs)
+	}
+}
+
+func TestOpenDefaultAppsSettingsStartsWindowsSettings(t *testing.T) {
+	app := &App{}
+
+	originalStarter := startHiddenCommand
+	defer func() { startHiddenCommand = originalStarter }()
+
+	var gotName string
+	var gotArgs []string
+	startHiddenCommand = func(name string, args ...string) error {
+		gotName = name
+		gotArgs = append([]string{}, args...)
+		return nil
+	}
+
+	app.OpenDefaultAppsSettings()
+
+	if gotName != "cmd" {
+		t.Fatalf("command name = %q, want cmd", gotName)
+	}
+	if len(gotArgs) != 3 || gotArgs[2] != "ms-settings:defaultapps" {
+		t.Fatalf("unexpected command args: %v", gotArgs)
+	}
+}
+
+func TestRegisterAsDefaultBrowserUsesHiddenRegistryCommands(t *testing.T) {
+	app := &App{}
+
+	originalExecutable := getExecutablePath
+	originalRunner := runHiddenCombinedCommand
+	defer func() {
+		getExecutablePath = originalExecutable
+		runHiddenCombinedCommand = originalRunner
+	}()
+
+	getExecutablePath = func() (string, error) {
+		return `C:\Apps\MyBrowser\my-browser.exe`, nil
+	}
+
+	var invocations [][]string
+	runHiddenCombinedCommand = func(name string, args ...string) ([]byte, error) {
+		invocations = append(invocations, append([]string{name}, args...))
+		return []byte("ok"), nil
+	}
+
+	msg, err := app.RegisterAsDefaultBrowser()
+	if err != nil {
+		t.Fatalf("RegisterAsDefaultBrowser returned error: %v", err)
+	}
+
+	if !strings.Contains(msg, "已成功将 MyBrowser 注册") {
+		t.Fatalf("unexpected message: %q", msg)
+	}
+	if len(invocations) == 0 {
+		t.Fatal("expected registry commands to be invoked")
+	}
+	if invocations[0][0] != "reg" || invocations[0][1] != "add" {
+		t.Fatalf("unexpected first command: %v", invocations[0])
+	}
+}
+
+func TestUnregisterAsDefaultBrowserIgnoresMissingRegistryKeys(t *testing.T) {
+	app := &App{}
+
+	originalExecutable := getExecutablePath
+	originalRunner := runHiddenCombinedCommand
+	defer func() {
+		getExecutablePath = originalExecutable
+		runHiddenCombinedCommand = originalRunner
+	}()
+
+	getExecutablePath = func() (string, error) {
+		return `C:\Apps\MyBrowser\my-browser.exe`, nil
+	}
+
+	runHiddenCombinedCommand = func(name string, args ...string) ([]byte, error) {
+		return []byte("ERROR: 系统找不到指定的注册表项或值。"), fmt.Errorf("exit status 1")
+	}
+
+	msg, err := app.UnregisterAsDefaultBrowser()
+	if err != nil {
+		t.Fatalf("UnregisterAsDefaultBrowser returned error: %v", err)
+	}
+	if !strings.Contains(msg, "已清理 MyBrowser 的注册表项") {
+		t.Fatalf("unexpected message: %q", msg)
+	}
+}
+
+func TestCreateDesktopShortcutUsesPowerShellCommand(t *testing.T) {
+	app := &App{}
+
+	originalExecutable := getExecutablePath
+	originalHomeDir := getUserHomeDir
+	originalRunner := runHiddenCombinedCommand
+	defer func() {
+		getExecutablePath = originalExecutable
+		getUserHomeDir = originalHomeDir
+		runHiddenCombinedCommand = originalRunner
+	}()
+
+	getExecutablePath = func() (string, error) {
+		return `C:\Apps\MyBrowser\my-browser.exe`, nil
+	}
+	getUserHomeDir = func() (string, error) {
+		return `C:\Users\Tester`, nil
+	}
+
+	var gotName string
+	var gotArgs []string
+	runHiddenCombinedCommand = func(name string, args ...string) ([]byte, error) {
+		gotName = name
+		gotArgs = append([]string{}, args...)
+		return []byte("ok"), nil
+	}
+
+	if err := app.CreateDesktopShortcut(); err != nil {
+		t.Fatalf("CreateDesktopShortcut returned error: %v", err)
+	}
+
+	if gotName != "powershell" {
+		t.Fatalf("command name = %q, want powershell", gotName)
+	}
+	if len(gotArgs) != 3 {
+		t.Fatalf("unexpected command args: %v", gotArgs)
+	}
+	if !strings.Contains(gotArgs[2], `C:\Users\Tester\Desktop\MyBrowser Pro.lnk`) {
+		t.Fatalf("powershell command missing shortcut path: %q", gotArgs[2])
+	}
+	if !strings.Contains(gotArgs[2], `C:\Apps\MyBrowser\my-browser.exe`) {
+		t.Fatalf("powershell command missing exe path: %q", gotArgs[2])
 	}
 }
 

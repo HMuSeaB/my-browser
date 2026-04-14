@@ -162,6 +162,21 @@ type bidiGetTreeResult struct {
 
 var bidiEndpointPattern = regexp.MustCompile(`ws://(?:127\.0\.0\.1|localhost):\d+(?:/[^\s"]*)?`)
 
+var (
+	getExecutablePath        = os.Executable
+	getUserHomeDir           = os.UserHomeDir
+	runHiddenCombinedCommand = func(name string, args ...string) ([]byte, error) {
+		cmd := exec.Command(name, args...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		return cmd.CombinedOutput()
+	}
+	startHiddenCommand = func(name string, args ...string) error {
+		cmd := exec.Command(name, args...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		return cmd.Start()
+	}
+)
+
 // NewApp creates a new App application struct
 func NewApp() *App {
 	a := &App{
@@ -2281,7 +2296,7 @@ func (a *App) ExportProfile(profileID string) error {
 
 // RegisterAsDefaultBrowser 将当前程序注册为 Windows 可识别的浏览器
 func (a *App) RegisterAsDefaultBrowser() (string, error) {
-	exePath, err := os.Executable()
+	exePath, err := getExecutablePath()
 	if err != nil {
 		return "", fmt.Errorf("获取程序路径失败: %v", err)
 	}
@@ -2330,10 +2345,7 @@ func (a *App) RegisterAsDefaultBrowser() (string, error) {
 	}
 
 	for _, cmdArgs := range commands {
-		cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
-		// 隐藏黑色 CMD 窗口
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-		if out, err := cmd.CombinedOutput(); err != nil {
+		if out, err := runHiddenCombinedCommand(cmdArgs[0], cmdArgs[1:]...); err != nil {
 			a.Log("error", fmt.Sprintf("修改注册表失败 (可能被杀毒软件拦截): %v, 输出: %s", err, string(out)))
 			return "", fmt.Errorf("修改注册表失败: %v", err)
 		}
@@ -2351,7 +2363,9 @@ func (a *App) RegisterAsDefaultBrowser() (string, error) {
 func (a *App) OpenDefaultAppsSettings() {
 	// 使用 ms-settings 协议直接唤起设置页并定位到相关应用
 	a.Log("info", "正在唤起 Windows 默认应用设置页面...")
-	exec.Command("cmd", "/c", "start", "ms-settings:defaultapps").Run()
+	if err := startHiddenCommand("cmd", "/c", "start", "ms-settings:defaultapps"); err != nil {
+		a.Log("warn", fmt.Sprintf("打开 Windows 默认应用设置失败: %v", err))
+	}
 }
 
 // OpenDataDirectory 打开当前正在使用的数据目录
@@ -2367,9 +2381,7 @@ func (a *App) OpenDataDirectory() error {
 
 	// Use the shell to open Explorer so we can hide the transient cmd window
 	// without hiding the actual file explorer window itself.
-	cmd := exec.Command("cmd", "/c", "start", "", dataDir)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	if err := cmd.Start(); err != nil {
+	if err := startHiddenCommand("cmd", "/c", "start", "", dataDir); err != nil {
 		return fmt.Errorf("打开数据目录失败: %v", err)
 	}
 
@@ -2452,7 +2464,7 @@ func (a *App) RotateAutomationToken() (string, error) {
 
 // UnregisterAsDefaultBrowser 清理当前程序添加的浏览器注册表项
 func (a *App) UnregisterAsDefaultBrowser() (string, error) {
-	exePath, err := os.Executable()
+	exePath, err := getExecutablePath()
 	if err != nil {
 		return "", fmt.Errorf("获取程序路径失败: %v", err)
 	}
@@ -2467,9 +2479,7 @@ func (a *App) UnregisterAsDefaultBrowser() (string, error) {
 	}
 
 	for _, cmdArgs := range commands {
-		cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-		out, cmdErr := cmd.CombinedOutput()
+		out, cmdErr := runHiddenCombinedCommand(cmdArgs[0], cmdArgs[1:]...)
 		if cmdErr != nil {
 			outputText := strings.ToLower(string(out))
 			// 注册表不存在时不视为失败，便于重复清理。
@@ -2536,12 +2546,12 @@ func (a *App) ImportCookiesFromFile() (string, error) {
 
 // CreateDesktopShortcut 在桌面上生成本程序的快捷方式
 func (a *App) CreateDesktopShortcut() error {
-	exePath, err := os.Executable()
+	exePath, err := getExecutablePath()
 	if err != nil {
 		return fmt.Errorf("无法获取程序路径: %v", err)
 	}
 
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := getUserHomeDir()
 	if err != nil {
 		return fmt.Errorf("无法获取用户主目录: %v", err)
 	}
@@ -2552,11 +2562,7 @@ func (a *App) CreateDesktopShortcut() error {
 	// 使用 PowerShell 创建快捷方式
 	psCommand := fmt.Sprintf(`$WshShell = New-Object -comObject WScript.Shell; $Shortcut = $WshShell.CreateShortcut('%s'); $Shortcut.TargetPath = '%s'; $Shortcut.WorkingDirectory = '%s'; $Shortcut.Save()`, shortcutPath, exePath, filepath.Dir(exePath))
 
-	cmd := exec.Command("powershell", "-NoProfile", "-Command", psCommand)
-	// 隐藏黑色 CMD 窗口
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-
-	output, err := cmd.CombinedOutput()
+	output, err := runHiddenCombinedCommand("powershell", "-NoProfile", "-Command", psCommand)
 	if err != nil {
 		return fmt.Errorf("PowerShell 创建失败: %v, 输出: %s", err, string(output))
 	}
