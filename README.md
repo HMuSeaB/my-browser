@@ -204,6 +204,16 @@ finally:
 - 默认 Windows 构建产物位于 `build/bin/my-browser.exe`
 - 桌面流程的手动检查项整理在： [docs/SMOKE_CHECKLIST.md](docs/SMOKE_CHECKLIST.md)
 
+## 🚢 GitHub Release 构建
+
+- 仓库现在包含 GitHub Actions 工作流： [windows-release.yml](.github/workflows/windows-release.yml)
+- 当推送形如 `v*` 的 tag 时，GitHub 会自动：
+  - 在 Windows Runner 上执行 `wails build -clean -f`
+  - 产出 `my-browser.exe`
+  - 组装便携包 zip，内容包含 `my-browser.exe`、`portable.flag`、`README-QuickStart.txt`
+  - 将产物上传到对应 GitHub Release
+- 也可以手动通过 `workflow_dispatch` 触发，先验证构建链路是否正常。
+
 ## 🔒 隐私声明
 本项目为纯本地开源工具。除非您手动配置了外部代理，否则所有流量和环境数据仅驻留在您的设备上。
 
