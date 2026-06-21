@@ -22,6 +22,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	mrand "math/rand"
+
+
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -1467,81 +1470,145 @@ func (a *App) getCamoufoxPath() (string, error) {
 	return "", fmt.Errorf("未找到 camoufox.exe")
 }
 
-// setupProxy 配置 Firefox 的代理设置
-func (a *App) setupProxy(userDataDir, proxyStr string) error {
-	if proxyStr == "" {
-		return nil
+// setupStealthPrefs 配置 Firefox 的代理与防检测首选项
+func (a *App) setupStealthPrefs(userDataDir, proxyStr string) error {
+	prefsPath := filepath.Join(userDataDir, "prefs.js")
+
+	// 读取已有的 prefs.js，避免破坏用户其他自定义首选项
+	var existingContent string
+	if _, err := os.Stat(prefsPath); err == nil {
+		if data, readErr := os.ReadFile(prefsPath); readErr == nil {
+			existingContent = string(data)
+		}
 	}
 
-	prefsPath := filepath.Join(userDataDir, "prefs.js")
-	var proxyType int = 1
-	var httpHost, httpPort string
-	var sslHost, sslPort string
-	var socksHost, socksPort string
-	var socksVersion int = 5
+	// 准备要追加或覆写的 prefs 列表
+	prefsMap := map[string]string{
+		"dom.webdriver.enabled":             "false", // 隐藏 navigator.webdriver
+		"marionette.enabled":                "false", // 屏蔽 Marionette 反检测痕迹
+		"media.peerconnection.enabled":       "true",  // 启用 WebRTC
+		"media.navigator.enabled":           "true",
+		"privacy.resistFingerprinting":      "false", // 避免干扰自定义指纹
+		"devtools.debugger.remote-enabled":  "false",
+	}
 
-	// 解析逻辑优化
-	tempProxy := proxyStr
-	if strings.Contains(tempProxy, "://") {
-		parts := strings.Split(tempProxy, "://")
-		protocol := parts[0]
-		addr := parts[1]
+	// 解析代理配置
+	if proxyStr != "" {
+		var proxyType int = 1
+		var httpHost, httpPort string
+		var sslHost, sslPort string
+		var socksHost, socksPort string
+		var socksVersion int = 5
 
-		hostPort := strings.Split(addr, ":")
-		if len(hostPort) == 2 {
-			if protocol == "http" || protocol == "https" {
+		tempProxy := proxyStr
+		if strings.Contains(tempProxy, "://") {
+			parts := strings.Split(tempProxy, "://")
+			protocol := parts[0]
+			addr := parts[1]
+
+			hostPort := strings.Split(addr, ":")
+			if len(hostPort) == 2 {
+				if protocol == "http" || protocol == "https" {
+					httpHost, httpPort = hostPort[0], hostPort[1]
+					sslHost, sslPort = hostPort[0], hostPort[1]
+				} else if strings.Contains(protocol, "socks") {
+					socksHost, socksPort = hostPort[0], hostPort[1]
+				}
+			}
+		} else {
+			hostPort := strings.Split(tempProxy, ":")
+			if len(hostPort) == 2 {
 				httpHost, httpPort = hostPort[0], hostPort[1]
 				sslHost, sslPort = hostPort[0], hostPort[1]
-			} else if strings.Contains(protocol, "socks") {
-				socksHost, socksPort = hostPort[0], hostPort[1]
 			}
 		}
-	} else {
-		// 默认处理为 http
-		hostPort := strings.Split(tempProxy, ":")
-		if len(hostPort) == 2 {
-			httpHost, httpPort = hostPort[0], hostPort[1]
-			sslHost, sslPort = hostPort[0], hostPort[1]
+
+		prefsMap["network.proxy.type"] = fmt.Sprintf("%d", proxyType)
+		if httpHost != "" && httpPort != "" {
+			prefsMap["network.proxy.http"] = fmt.Sprintf(`"%s"`, httpHost)
+			prefsMap["network.proxy.http_port"] = httpPort
+			prefsMap["network.proxy.ssl"] = fmt.Sprintf(`"%s"`, sslHost)
+			prefsMap["network.proxy.ssl_port"] = sslPort
+		}
+		if socksHost != "" && socksPort != "" {
+			prefsMap["network.proxy.socks"] = fmt.Sprintf(`"%s"`, socksHost)
+			prefsMap["network.proxy.socks_port"] = socksPort
+			prefsMap["network.proxy.socks_version"] = fmt.Sprintf("%d", socksVersion)
+		}
+		prefsMap["network.proxy.socks_remote_dns"] = "true"
+		prefsMap["network.proxy.share_proxy_settings"] = "true"
+	}
+
+	// 重构 prefs.js 的内容
+	lines := strings.Split(existingContent, "\n")
+	newLines := make([]string, 0, len(lines)+len(prefsMap))
+
+	// 过滤掉已有冲突的 key 并在后面重新写入
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		// 检查这行是否包含我们要设置的 key
+		matched := false
+		for key := range prefsMap {
+			if strings.Contains(trimmed, fmt.Sprintf(`"%s"`, key)) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			newLines = append(newLines, line)
 		}
 	}
 
-	content := fmt.Sprintf(`
-user_pref("network.proxy.type", %d);
-user_pref("network.proxy.http", "%s");
-user_pref("network.proxy.http_port", %s);
-user_pref("network.proxy.ssl", "%s");
-user_pref("network.proxy.ssl_port", %s);
-user_pref("network.proxy.socks", "%s");
-user_pref("network.proxy.socks_port", %s);
-user_pref("network.proxy.socks_version", %d);
-user_pref("network.proxy.socks_remote_dns", true);
-user_pref("network.proxy.share_proxy_settings", true);
-`, proxyType, httpHost, httpPort, sslHost, sslPort, socksHost, socksPort, socksVersion)
+	// 写入新的配置
+	for key, val := range prefsMap {
+		newLines = append(newLines, fmt.Sprintf(`user_pref("%s", %s);`, key, val))
+	}
 
-	return os.WriteFile(prefsPath, []byte(content), 0644)
+	output := strings.Join(newLines, "\n") + "\n"
+	return os.WriteFile(prefsPath, []byte(output), 0644)
 }
 
 // generateFingerprintConfig 为指定环境生成随机且唯一的指纹配置
 func (a *App) generateFingerprintConfig(profile BrowserProfile) map[string]interface{} {
-	// 这里模拟 Camoufox 的配置生成
-	// 实际生产中可以根据 profile.ID 种子化随机数，确保同一环境指纹固定
 	config := make(map[string]interface{})
 
+	// 1. 基于 profile.ID 建立哈希随机种子，确保环境指纹一致固定
+	seed := hashStringToInt64(profile.ID)
+	r := mrand.New(mrand.NewSource(seed))
+
+
+	// 2. 匹配操作系统预设
+	platform := profile.Platform
+	if platform != "Windows" && platform != "macOS" && platform != "Linux" {
+		platform = "Windows"
+	}
+	preset := HardwarePresets[platform]
+
+	// 3. 随机选择 GPU 与分辨率
+	gpu := preset.GPUs[r.Intn(len(preset.GPUs))]
+	res := preset.Resolutions[r.Intn(len(preset.Resolutions))]
+
+	// 4. 随机但一致的 Canvas aaOffset (偏移值在 10 ~ 30)
+	canvasOffset := r.Intn(20) + 10
+
 	config["navigator.userAgent"] = profile.UA
-	config["navigator.platform"] = profile.Platform
+	config["navigator.platform"] = getNativePlatformString(platform)
 	config["navigator.language"] = "zh-CN"
 	config["navigator.languages"] = []string{"zh-CN", "zh", "en-US", "en"}
 
 	// WebGL 混淆
-	config["webGl:vendor"] = "Google Inc. (Intel)"
-	config["webGl:renderer"] = "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0)"
+	config["webGl:vendor"] = gpu.Vendor
+	config["webGl:renderer"] = gpu.Renderer
 
-	// Canvas 噪音噪音
-	config["canvas:aaOffset"] = 12 // 固定偏移或随机
+	// Canvas 噪音
+	config["canvas:aaOffset"] = canvasOffset
 
-	// 屏幕分辨率 (可选)
-	config["screen.width"] = 1920
-	config["screen.height"] = 1080
+	// 屏幕分辨率
+	config["screen.width"] = res.Width
+	config["screen.height"] = res.Height
 
 	config["timezone"] = "Asia/Shanghai"
 	config["locale:all"] = "zh-CN"
@@ -2049,8 +2116,8 @@ func (a *App) prepareProfileLaunch(profile BrowserProfile) (string, string, erro
 		return "", "", err
 	}
 
-	if err := a.setupProxy(userDataDir, profile.Proxy); err != nil {
-		fmt.Printf("配置代理失败: %v\n", err)
+	if err := a.setupStealthPrefs(userDataDir, profile.Proxy); err != nil {
+		fmt.Printf("配置首选项与代理失败: %v\n", err)
 	}
 
 	if err := a.setupCookies(userDataDir, profile.Cookies); err != nil {
