@@ -274,7 +274,7 @@ func (a *App) resolvePortableDataDir() (string, bool, error) {
 		flagPath := filepath.Join(baseDir, "portable.flag")
 		if _, statErr := os.Stat(flagPath); statErr == nil {
 			return filepath.Join(baseDir, "MyBrowserData"), true, nil
-		} else if statErr != nil && !os.IsNotExist(statErr) {
+		} else if !os.IsNotExist(statErr) {
 			return "", false, fmt.Errorf("检查便携模式标记失败 [%s]: %w", flagPath, statErr)
 		}
 	}
@@ -923,6 +923,9 @@ func (a *App) watchAutomationPipe(sessionID, stream string, reader io.ReadCloser
 		if strings.Contains(strings.ToLower(line), "webdriver bidi") || strings.Contains(strings.ToLower(line), "remote") {
 			a.Log("info", fmt.Sprintf("自动化会话 [%s] %s: %s", sessionID, stream, line))
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		a.Log("warn", fmt.Sprintf("读取自动化会话管道时出错: %v", err))
 	}
 }
 
