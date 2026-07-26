@@ -14,6 +14,10 @@ export function CreateProfile(arg1, arg2, arg3, arg4, arg5) {
   return window['go']['main']['App']['CreateProfile'](arg1, arg2, arg3, arg4, arg5);
 }
 
+export function DeleteExtension(arg1) {
+  return window['go']['main']['App']['DeleteExtension'](arg1);
+}
+
 export function DeleteProfile(arg1) {
   return window['go']['main']['App']['DeleteProfile'](arg1);
 }
@@ -44,6 +48,10 @@ export function GetAutomationSessions() {
 
 export function GetAutomationToken() {
   return window['go']['main']['App']['GetAutomationToken']();
+}
+
+export function GetExtensions() {
+  return window['go']['main']['App']['GetExtensions']();
 }
 
 export function GetProfiles() {
@@ -84,6 +92,18 @@ export function ImportProfile() {
 
 export function ImportUserScriptFromFile() {
   return window['go']['main']['App']['ImportUserScriptFromFile']();
+}
+
+export function InstallExtensionFromDialog() {
+  return window['go']['main']['App']['InstallExtensionFromDialog']();
+}
+
+export function InstallExtensionFromDirectoryDialog() {
+  return window['go']['main']['App']['InstallExtensionFromDirectoryDialog']();
+}
+
+export function InstallExtensionFromPath(arg1) {
+  return window['go']['main']['App']['InstallExtensionFromPath'](arg1);
 }
 
 export function InstallUserScriptsFromPaths(arg1) {
@@ -130,6 +150,14 @@ export function SetAutomationEnabled(arg1) {
   return window['go']['main']['App']['SetAutomationEnabled'](arg1);
 }
 
+export function SetExtensionEnabled(arg1, arg2) {
+  return window['go']['main']['App']['SetExtensionEnabled'](arg1, arg2);
+}
+
+export function SetProfileExtensions(arg1, arg2) {
+  return window['go']['main']['App']['SetProfileExtensions'](arg1, arg2);
+}
+
 export function SetProfileScripts(arg1, arg2) {
   return window['go']['main']['App']['SetProfileScripts'](arg1, arg2);
 }
@@ -172,4 +200,8 @@ export function UpdateProfile(arg1) {
 
 export function UpdateProxy(arg1) {
   return window['go']['main']['App']['UpdateProxy'](arg1);
+}
+
+export function InstallFromDroppedPaths(arg1) {
+  return window['go']['main']['App']['InstallFromDroppedPaths'](arg1);
 }

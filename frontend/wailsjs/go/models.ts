@@ -56,6 +56,42 @@ export namespace main {
 	        this.last_error = source["last_error"];
 	    }
 	}
+	export class BrowserExtension {
+	    id: string;
+	    gecko_id: string;
+	    name: string;
+	    version: string;
+	    description: string;
+	    manifest_version: number;
+	    has_popup: boolean;
+	    gecko_id_injected: boolean;
+	    permissions: string[];
+	    host_permissions: string[];
+	    incompatible: string[];
+	    enabled: boolean;
+	    installed_at: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new BrowserExtension(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.gecko_id = source["gecko_id"];
+	        this.name = source["name"];
+	        this.version = source["version"];
+	        this.description = source["description"];
+	        this.manifest_version = source["manifest_version"];
+	        this.has_popup = source["has_popup"];
+	        this.gecko_id_injected = source["gecko_id_injected"];
+	        this.permissions = source["permissions"];
+	        this.host_permissions = source["host_permissions"];
+	        this.incompatible = source["incompatible"];
+	        this.enabled = source["enabled"];
+	        this.installed_at = source["installed_at"];
+	    }
+	}
 	export class BrowserProfile {
 	    id: string;
 	    name: string;
@@ -67,6 +103,7 @@ export namespace main {
 	    cookies: string;
 	    create_at: number;
 	    enabled_scripts: string[];
+	    enabled_extensions: string[];
 	
 	    static createFrom(source: any = {}) {
 	        return new BrowserProfile(source);
@@ -84,6 +121,29 @@ export namespace main {
 	        this.cookies = source["cookies"];
 	        this.create_at = source["create_at"];
 	        this.enabled_scripts = source["enabled_scripts"];
+	        this.enabled_extensions = source["enabled_extensions"];
+	    }
+	}
+	export class DropOutcome {
+	    file_name: string;
+	    kind: string;
+	    ok: boolean;
+	    error: string;
+	    name: string;
+	    unsupported: string[];
+
+	    static createFrom(source: any = {}) {
+	        return new DropOutcome(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.file_name = source["file_name"];
+	        this.kind = source["kind"];
+	        this.ok = source["ok"];
+	        this.error = source["error"];
+	        this.name = source["name"];
+	        this.unsupported = source["unsupported"];
 	    }
 	}
 	export class ProxyEntry {

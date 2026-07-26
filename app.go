@@ -48,6 +48,8 @@ type BrowserProfile struct {
 	// EnabledScripts 为本环境启用的用户脚本 ID 列表。
 	// nil 表示未启用任何脚本，旧版 profiles.json 反序列化后即为该值，天然向后兼容。
 	EnabledScripts []string `json:"enabled_scripts"`
+	// EnabledExtensions 为本环境启用的浏览器扩展内部 ID 列表
+	EnabledExtensions []string `json:"enabled_extensions"`
 }
 
 // UserScript 代表一个用户脚本（油猴脚本）
@@ -139,6 +141,7 @@ type App struct {
 	profiles    []BrowserProfile
 	proxies     []ProxyEntry
 	userScripts []UserScript
+	extensions  []BrowserExtension
 	// assetFetcher 用于下载脚本的外部依赖。留空时走 fetchScriptAsset，
 	// 测试可替换它以避免真实网络请求。
 	assetFetcher         func(rawURL string) ([]byte, error)
@@ -232,6 +235,7 @@ func NewApp() *App {
 	a.loadProfiles()
 	a.loadProxies()
 	a.loadUserScripts()
+	a.loadExtensions()
 	return a
 }
 
@@ -3132,6 +3136,11 @@ func (a *App) prepareProfileLaunch(profile BrowserProfile) (string, string, erro
 	// 按本环境启用清单生成用户脚本扩展；未启用脚本时不产生任何文件
 	if err := a.setupUserScripts(userDataDir, profile); err != nil {
 		a.Log("warn", fmt.Sprintf("用户脚本注入失败: %v", err))
+	}
+
+	// 按本环境启用清单铺设浏览器扩展；须在用户脚本之后，二者共用 extensions 目录
+	if err := a.setupExtensions(userDataDir, profile); err != nil {
+		a.Log("warn", fmt.Sprintf("扩展装载失败: %v", err))
 	}
 
 	return exePath, userDataDir, nil

@@ -8,6 +8,8 @@ export function CreateDesktopShortcut():Promise<void>;
 
 export function CreateProfile(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string):Promise<main.BrowserProfile>;
 
+export function DeleteExtension(arg1:string):Promise<void>;
+
 export function DeleteProfile(arg1:string):Promise<void>;
 
 export function DeleteProxy(arg1:string):Promise<void>;
@@ -23,6 +25,8 @@ export function GetAutomationInfo():Promise<main.AutomationInfo>;
 export function GetAutomationSessions():Promise<Array<main.AutomationSession>>;
 
 export function GetAutomationToken():Promise<string>;
+
+export function GetExtensions():Promise<Array<main.BrowserExtension>>;
 
 export function GetProfiles():Promise<Array<main.BrowserProfile>>;
 
@@ -43,6 +47,12 @@ export function ImportCookiesFromFile():Promise<string>;
 export function ImportProfile():Promise<void>;
 
 export function ImportUserScriptFromFile():Promise<main.UserScript>;
+
+export function InstallExtensionFromDialog():Promise<main.BrowserExtension>;
+
+export function InstallExtensionFromDirectoryDialog():Promise<main.BrowserExtension>;
+
+export function InstallExtensionFromPath(arg1:string):Promise<main.BrowserExtension>;
 
 export function InstallUserScriptsFromPaths(arg1:Array<string>):Promise<Array<main.ScriptInstallOutcome>>;
 
@@ -66,6 +76,10 @@ export function SaveUserScript(arg1:string,arg2:string):Promise<main.UserScript>
 
 export function SetAutomationEnabled(arg1:boolean):Promise<void>;
 
+export function SetExtensionEnabled(arg1:string,arg2:boolean):Promise<void>;
+
+export function SetProfileExtensions(arg1:string,arg2:Array<string>):Promise<void>;
+
 export function SetProfileScripts(arg1:string,arg2:Array<string>):Promise<void>;
 
 export function SetUserScriptEnabled(arg1:string,arg2:boolean):Promise<void>;
@@ -87,3 +101,5 @@ export function UnregisterAsDefaultBrowser():Promise<string>;
 export function UpdateProfile(arg1:main.BrowserProfile):Promise<void>;
 
 export function UpdateProxy(arg1:main.ProxyEntry):Promise<void>;
+
+export function InstallFromDroppedPaths(arg1:Array<string>):Promise<Array<main.DropOutcome>>;

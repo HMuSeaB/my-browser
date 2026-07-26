@@ -1,6 +1,8 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { GetProfiles, LaunchBrowser, UpdateProfile, CreateProfile, DeleteProfile, SyncCookies, ResetCookies, TestProxy, GetProxies, AddProxy, DeleteProxy, TestProxyEntry, ExportCookies, ExportProfile, ImportProfile, ImportCookiesFromFile, RegisterAsDefaultBrowser, OpenDefaultAppsSettings, GetStartupURL, CreateDesktopShortcut, OpenDataDirectory, UnregisterAsDefaultBrowser, GetStorageDirectory, GetStorageMode, GetAutomationInfo, GetAutomationSessions, GetAutomationToken, StartAutomationSession, StopAutomationSession, RotateAutomationToken, SetAutomationEnabled, GetUserScripts, GetUserScriptSource, SaveUserScript, DeleteUserScript, SetUserScriptEnabled, SetUserScriptWorld, SetProfileScripts, ImportUserScriptFromFile, InstallUserScriptsFromPaths, RedownloadScriptAssets } from '../wailsjs/go/main/App'
+import { GetProfiles, LaunchBrowser, UpdateProfile, CreateProfile, DeleteProfile, SyncCookies, ResetCookies, TestProxy, GetProxies, AddProxy, DeleteProxy, TestProxyEntry, ExportCookies, ExportProfile, ImportProfile, ImportCookiesFromFile, RegisterAsDefaultBrowser, OpenDefaultAppsSettings, GetStartupURL, CreateDesktopShortcut, OpenDataDirectory, UnregisterAsDefaultBrowser, GetStorageDirectory, GetStorageMode, GetAutomationInfo, GetAutomationSessions, GetAutomationToken, StartAutomationSession, StopAutomationSession, RotateAutomationToken, SetAutomationEnabled, GetUserScripts, GetUserScriptSource, SaveUserScript, DeleteUserScript, SetUserScriptEnabled, SetUserScriptWorld, SetProfileScripts, ImportUserScriptFromFile, InstallUserScriptsFromPaths, RedownloadScriptAssets,
+GetExtensions, InstallFromDroppedPaths, InstallExtensionFromDialog, InstallExtensionFromDirectoryDialog,
+SetExtensionEnabled, DeleteExtension, SetProfileExtensions } from '../wailsjs/go/main/App'
 import { EventsOn, OnFileDrop, OnFileDropOff } from '../wailsjs/runtime'
 
 import { 
@@ -24,7 +26,8 @@ import {
   Palette,
   Search,
   FileCode,
-  ShieldAlert
+  ShieldAlert,
+  Puzzle
 } from 'lucide-vue-next'
 const profiles = ref([])
 const loading = ref(true)
@@ -40,6 +43,7 @@ const testingProxy = ref(false)
 const currentView = ref('profiles') // 'profiles', 'proxies', 'scripts', 'logs', 'automation'
 
 const userScripts = ref([])
+const extensions = ref([])
 const isDraggingScript = ref(false)
 const showScriptModal = ref(false)
 const editingScript = ref(null)   // 正在编辑的脚本元数据；null 表示新建
@@ -222,6 +226,20 @@ const filteredScripts = computed(() => {
 
 const enabledScriptCount = computed(() => userScripts.value.filter((s) => s.enabled).length)
 
+const filteredExtensions = computed(() => {
+  if (!normalizedSearchQuery.value) return extensions.value
+  return extensions.value.filter((e) => {
+    const haystack = [e.name, e.description, (e.permissions || []).join(' ')]
+      .join(' ').toLowerCase()
+    return haystack.includes(normalizedSearchQuery.value)
+  })
+})
+
+const enabledExtensionCount = computed(() => extensions.value.filter((e) => e.enabled).length)
+const incompatibleExtensionCount = computed(
+  () => extensions.value.filter((e) => (e.incompatible || []).length > 0).length
+)
+
 // page 模式会在页面留下可被检测的痕迹，单独统计以便在概览提示
 const pageWorldScriptCount = computed(
   () => userScripts.value.filter((s) => s.enabled && s.world === 'page').length
@@ -348,6 +366,7 @@ const currentViewTitle = computed(() => {
   if (currentView.value === 'profiles') return detailProfile.value ? '环境详情' : '环境'
   if (currentView.value === 'proxies') return '代理'
   if (currentView.value === 'scripts') return '脚本'
+  if (currentView.value === 'extensions') return '扩展'
   if (currentView.value === 'automation') return '自动化'
   if (currentView.value === 'logs') return '日志'
   return '工作台'
@@ -360,6 +379,7 @@ const currentViewDescription = computed(() => {
   }
   if (currentView.value === 'proxies') return '维护代理池并检查连通性'
   if (currentView.value === 'scripts') return '管理用户脚本，并在各环境的设置中按需启用'
+  if (currentView.value === 'extensions') return '安装浏览器扩展，并在各环境的设置中按需启用'
   if (currentView.value === 'automation') return '查看本地 API、会话状态和接入示例'
   if (currentView.value === 'logs') return '跟踪运行日志和最近事件'
   return ''
@@ -392,6 +412,14 @@ const currentViewStats = computed(() => {
       { label: '脚本', value: `${filteredScripts.value.length}/${userScripts.value.length}` },
       { label: '已启用', value: String(enabledScriptCount.value) },
       { label: '主世界注入', value: String(pageWorldScriptCount.value) },
+    ]
+  }
+
+  if (currentView.value === 'extensions') {
+    return [
+      { label: '扩展', value: `${filteredExtensions.value.length}/${extensions.value.length}` },
+      { label: '已启用', value: String(enabledExtensionCount.value) },
+      { label: '不兼容', value: String(incompatibleExtensionCount.value) },
     ]
   }
 
@@ -1015,24 +1043,103 @@ const handleDroppedFiles = async (paths) => {
 
   isDraggingScript.value = false
   try {
-    const outcomes = await InstallUserScriptsFromPaths(paths)
+    // 后端按形态分流：目录与 .zip/.crx 装为扩展，.user.js 装为脚本
+    const outcomes = await InstallFromDroppedPaths(paths)
     await fetchUserScripts()
+    await fetchExtensions()
 
-    const succeeded = outcomes.filter((o) => o.ok)
+    const scripts = outcomes.filter((o) => o.ok && o.kind === 'script')
+    const exts = outcomes.filter((o) => o.ok && o.kind === 'extension')
     const failed = outcomes.filter((o) => !o.ok)
 
-    if (succeeded.length > 0) {
+    if (scripts.length > 0) {
       currentView.value = 'scripts'
-      const names = succeeded.map((o) => o.script.name).join('、')
-      pushNotice(`已安装 ${succeeded.length} 个脚本：${names}。请在环境设置中启用。`, 'success', '安装成功')
-      succeeded.forEach((o) => warnIfUnsupported(o.script))
+      pushNotice(
+        `已安装 ${scripts.length} 个脚本：${scripts.map((o) => o.name).join('、')}。请在环境设置中启用。`,
+        'success', '安装成功'
+      )
     }
+    if (exts.length > 0) {
+      currentView.value = 'extensions'
+      pushNotice(
+        `已安装 ${exts.length} 个扩展：${exts.map((o) => o.name).join('、')}。请在环境设置中启用。`,
+        'success', '安装成功'
+      )
+    }
+    outcomes.filter((o) => o.ok && (o.unsupported || []).length > 0).forEach((o) => {
+      pushNotice(
+        `「${o.name}」使用了 ${o.unsupported.join('、')}，当前环境不支持，启用后不会正常工作。`,
+        'error', '兼容性提醒'
+      )
+    })
     failed.forEach((o) => {
       pushNotice(`${o.file_name}：${o.error}`, 'error', '安装失败')
     })
   } catch (err) {
-    pushNotice(formatErrorMessage(err, '安装拖入的脚本失败'), 'error', '安装失败')
+    pushNotice(formatErrorMessage(err, '安装拖入的内容失败'), 'error', '安装失败')
   }
+}
+
+// --- 浏览器扩展 ---
+
+const fetchExtensions = async () => {
+  try {
+    extensions.value = (await GetExtensions()) || []
+  } catch (err) {
+    pushNotice(formatErrorMessage(err, '加载扩展列表失败'), 'error', '加载失败')
+  }
+}
+
+const installExtension = async (loader, label) => {
+  try {
+    const ext = await loader()
+    if (!ext || !ext.id) return
+    await fetchExtensions()
+    pushNotice(`已安装扩展「${ext.name}」，请在环境设置中启用。`, 'success', '安装成功')
+    if ((ext.incompatible || []).length > 0) {
+      pushNotice(
+        `「${ext.name}」使用了 ${ext.incompatible.join('、')}，当前环境不支持，启用后不会正常工作。`,
+        'error', '兼容性提醒'
+      )
+    }
+  } catch (err) {
+    pushNotice(formatErrorMessage(err, `${label}失败`), 'error', '安装失败')
+  }
+}
+
+const handleInstallExtensionArchive = () =>
+  installExtension(InstallExtensionFromDialog, '安装扩展压缩包')
+
+const handleInstallExtensionFolder = () =>
+  installExtension(InstallExtensionFromDirectoryDialog, '安装扩展文件夹')
+
+const handleToggleExtension = async (ext) => {
+  try {
+    await SetExtensionEnabled(ext.id, !ext.enabled)
+    await fetchExtensions()
+  } catch (err) {
+    pushNotice(formatErrorMessage(err, '切换启用状态失败'), 'error', '操作失败')
+  }
+}
+
+const handleDeleteExtension = async (ext) => {
+  if (!confirm(`确定卸载扩展「${ext.name}」？所有环境中对它的启用也会一并清除。`)) return
+  try {
+    await DeleteExtension(ext.id)
+    await fetchExtensions()
+    await fetchProfiles()
+    pushNotice('扩展已卸载。', 'success', '卸载成功')
+  } catch (err) {
+    pushNotice(formatErrorMessage(err, '卸载扩展失败'), 'error', '卸载失败')
+  }
+}
+
+const toggleExtensionForEditingProfile = (extensionId) => {
+  if (!editingProfile.value) return
+  const list = editingProfile.value.enabled_extensions || []
+  editingProfile.value.enabled_extensions = list.includes(extensionId)
+    ? list.filter((id) => id !== extensionId)
+    : [...list, extensionId]
 }
 
 const handleToggleScript = async (script) => {
@@ -1272,6 +1379,7 @@ onMounted(async () => {
   fetchProfiles()
   fetchProxies()
   fetchUserScripts()
+  fetchExtensions()
   fetchAutomationState()
 
   // 拖入 .user.js 直接安装。useDropTarget 传 false，窗口内任意位置均可释放。
@@ -1342,8 +1450,8 @@ onUnmounted(() => {
       <div v-if="isDraggingScript" class="drop-overlay">
         <div class="drop-card glass">
           <FileCode :size="42" />
-          <strong>释放以安装用户脚本</strong>
-          <span>支持 .user.js / .js / .txt，可一次拖入多个</span>
+          <strong>释放以安装</strong>
+          <span>脚本 .user.js / .js / .txt，扩展 文件夹 / .zip / .crx，可一次拖入多个</span>
         </div>
       </div>
     </Transition>
@@ -1370,6 +1478,7 @@ onUnmounted(() => {
         <div class="nav-item" :class="{ active: currentView === 'profiles' }" @click="currentView = 'profiles'"><Monitor :size="18" :stroke-width="2"/>环境</div>
         <div class="nav-item" :class="{ active: currentView === 'proxies' }" @click="currentView = 'proxies'"><ShieldCheck :size="18" :stroke-width="2"/>代理</div>
         <div class="nav-item" :class="{ active: currentView === 'scripts' }" @click="currentView = 'scripts'"><FileCode :size="18" :stroke-width="2"/>脚本</div>
+        <div class="nav-item" :class="{ active: currentView === 'extensions' }" @click="currentView = 'extensions'"><Puzzle :size="18" :stroke-width="2"/>扩展</div>
         <div class="nav-item" :class="{ active: currentView === 'logs' }" @click="currentView = 'logs'"><TerminalSquare :size="18" :stroke-width="2"/>日志</div>
         <div class="nav-item" :class="{ active: currentView === 'automation' }" @click="currentView = 'automation'"><Bot :size="18" :stroke-width="2"/>自动化</div>
         <div class="nav-item register-btn" @click="handleRegisterBrowser"><Link :size="16" :stroke-width="2"/>注册默认浏览器</div>
@@ -1446,6 +1555,10 @@ onUnmounted(() => {
                <template v-else-if="currentView === 'scripts'">
                  <button @click="handleImportScript" class="btn-ghost" style="margin-right: 8px;">导入脚本文件</button>
                  <button @click="openScriptEditor(null)" class="btn-create">新建脚本</button>
+               </template>
+               <template v-else-if="currentView === 'extensions'">
+                 <button @click="handleInstallExtensionFolder" class="btn-ghost" style="margin-right: 8px;">选择文件夹</button>
+                 <button @click="handleInstallExtensionArchive" class="btn-create">安装 zip / crx</button>
                </template>
                <button v-else-if="currentView === 'automation'" @click="fetchAutomationState" class="btn-ghost">刷新状态</button>
                <button v-else-if="currentView === 'logs'" @click="logs = []" class="btn-ghost">清空日志</button>
@@ -1742,6 +1855,85 @@ onUnmounted(() => {
             </table>
           </div>
 
+          <!-- 浏览器扩展视图 -->
+          <div v-else-if="currentView === 'extensions'" class="list-view">
+            <div class="script-intro glass">
+              <p>
+                支持 <b>文件夹</b>、<b>.zip</b> 与 <b>.crx</b>，也可以直接拖进窗口任意位置安装。
+                <b>原始文件不会被修改</b>——Firefox 所需的扩展 ID 只在写入环境时补入副本。
+              </p>
+              <p class="script-intro-tip">
+                启用后重启环境生效。装好的扩展会出现在浏览器工具栏的拼图图标里，点击即可打开它的弹窗界面。
+              </p>
+              <p class="script-intro-tip">
+                浏览器的扩展管理页会提示「could not be verified」，这是未经 Mozilla 签名的正常表现，
+                不影响功能，网页也读不到该提示。只有提交 AMO 签名才能消除，通常无此必要。
+              </p>
+              <p class="script-intro-tip">
+                注意：扩展的权限远大于用户脚本，它可以自行发起网络请求。
+                虽然网页无法探测到扩展本身，但扩展访问的服务能看到该环境的真实出口 IP。
+              </p>
+            </div>
+
+            <table class="proxy-table glass">
+              <thead>
+                <tr>
+                  <th>名称</th>
+                  <th>版本</th>
+                  <th>权限</th>
+                  <th>弹窗</th>
+                  <th>启用</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="e in filteredExtensions" :key="e.id">
+                  <td>
+                    <div class="script-name">{{ e.name }}</div>
+                    <div v-if="e.description" class="script-desc">{{ e.description }}</div>
+                    <div v-if="(e.incompatible || []).length" class="script-blocked">
+                      <ShieldAlert :size="14" />
+                      <span>{{ e.incompatible.join('；') }}</span>
+                    </div>
+                    <div v-else-if="e.gecko_id_injected" class="script-deps-ok">
+                      已自动分配扩展 ID（原 manifest 未声明，原始文件未改动）
+                    </div>
+                  </td>
+                  <td>
+                    <code>{{ e.version || '-' }}</code>
+                    <div class="script-desc">MV{{ e.manifest_version }}</div>
+                  </td>
+                  <td>
+                    <code v-for="p in (e.permissions || [])" :key="p" class="script-match">{{ p }}</code>
+                    <div v-if="(e.host_permissions || []).length" class="script-desc">
+                      站点权限 {{ e.host_permissions.length }} 项
+                    </div>
+                    <span v-if="!(e.permissions || []).length && !(e.host_permissions || []).length"
+                          class="script-desc">无</span>
+                  </td>
+                  <td>{{ e.has_popup ? '有' : '—' }}</td>
+                  <td>
+                    <button
+                      @click="handleToggleExtension(e)"
+                      class="status-chip status-chip-button"
+                      :class="{ online: e.enabled }"
+                    >
+                      {{ e.enabled ? '已启用' : '未启用' }}
+                    </button>
+                  </td>
+                  <td>
+                    <button @click="handleDeleteExtension(e)" class="btn-icon del">卸载</button>
+                  </td>
+                </tr>
+                <tr v-if="filteredExtensions.length === 0">
+                  <td colspan="6" class="empty-table">
+                    还没有扩展。把文件夹或 .zip / .crx 拖进窗口，或点右上角的按钮安装。
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
           <!-- 3. 运行日志视图 -->
           <div v-else-if="currentView === 'automation'" class="automation-view">
             <div class="automation-grid">
@@ -1993,6 +2185,33 @@ onUnmounted(() => {
               <span class="hint">
                 仅「全局已启用」且在此勾选的脚本才会注入；未勾选任何脚本时本环境不会生成扩展，
                 暴露面与未使用该功能时完全一致。修改后需重启该环境生效。
+              </span>
+            </div>
+            <div class="field">
+              <label>本环境启用的浏览器扩展</label>
+              <div v-if="extensions.length === 0" class="hint">
+                还没有已安装的扩展，先到左侧「扩展」页安装。
+              </div>
+              <div v-else class="script-picker">
+                <label
+                  v-for="e in extensions"
+                  :key="e.id"
+                  class="script-picker-item"
+                  :class="{ disabled: !e.enabled }"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="(editingProfile.enabled_extensions || []).includes(e.id)"
+                    @change="toggleExtensionForEditingProfile(e.id)"
+                  />
+                  <span class="script-picker-name">{{ e.name }}</span>
+                  <span v-if="!e.enabled" class="script-picker-tag">全局未启用</span>
+                  <span v-else-if="(e.incompatible || []).length" class="script-picker-tag warn">不兼容</span>
+                  <span v-else-if="e.has_popup" class="script-picker-tag">有弹窗</span>
+                </label>
+              </div>
+              <span class="hint">
+                扩展会出现在浏览器工具栏的拼图图标中。修改后需重启该环境生效。
               </span>
             </div>
           </div>
