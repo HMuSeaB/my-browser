@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -54,12 +55,27 @@ type UserScript struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
 	Description string   `json:"description"`
-	Matches     []string `json:"matches"`  // 解析自 @match / @include
-	RunAt       string   `json:"run_at"`   // document_start | document_end | document_idle
-	World       string   `json:"world"`    // isolated（默认，页面不可检测）| page（会留下可检测痕迹）
-	Grants      []string `json:"grants"`   // 解析自 @grant
-	Enabled     bool     `json:"enabled"`  // 全局开关
-	UpdatedAt   int64    `json:"updated_at"`
+	Version     string   `json:"version"`
+	Matches     []string `json:"matches"` // 解析自 @match / @include
+	RunAt       string   `json:"run_at"`  // document_start | document_end | document_idle
+	World       string   `json:"world"`   // isolated（默认，页面不可检测）| page（会留下可检测痕迹）
+	Grants      []string `json:"grants"`  // 解析自 @grant
+	// Requires / Resources 为脚本声明的外部依赖原文
+	Requires  []string `json:"requires"`  // 解析自 @require
+	Resources []string `json:"resources"` // 解析自 @resource，格式为 "名称 URL"
+	// RequireAssets / ResourceAssets 为已成功下载到本地的依赖。
+	// 与上面的声明数量不一致即表示有依赖下载失败，脚本无法正常工作。
+	RequireAssets  []ScriptAsset `json:"require_assets"`
+	ResourceAssets []ScriptAsset `json:"resource_assets"`
+	Enabled        bool          `json:"enabled"` // 全局开关
+	UpdatedAt      int64         `json:"updated_at"`
+}
+
+// ScriptAsset 表示一个已下载到本地的脚本依赖
+type ScriptAsset struct {
+	Name string `json:"name"` // @resource 的资源名；@require 留空
+	URL  string `json:"url"`
+	File string `json:"file"` // 相对该脚本 deps 目录的文件名
 }
 
 // ProxyEntry 代表代理池中的一个条目
@@ -119,10 +135,13 @@ type automationSessionRuntime struct {
 
 // App struct
 type App struct {
-	ctx                  context.Context
-	profiles             []BrowserProfile
-	proxies              []ProxyEntry
-	userScripts          []UserScript
+	ctx         context.Context
+	profiles    []BrowserProfile
+	proxies     []ProxyEntry
+	userScripts []UserScript
+	// assetFetcher 用于下载脚本的外部依赖。留空时走 fetchScriptAsset，
+	// 测试可替换它以避免真实网络请求。
+	assetFetcher         func(rawURL string) ([]byte, error)
 	StartupURL           string // 用于从命令行拉起的 URL
 	listener             net.Listener
 	dataDir              string
@@ -555,6 +574,166 @@ func (a *App) getUserScriptSourcePath(id string) string {
 	return filepath.Join(a.getUserScriptSourceDir(), id+".user.js")
 }
 
+// getUserScriptDepsDir 返回某个脚本的依赖缓存目录。
+// 按脚本隔离而非全局共享，换来的是删除脚本时可直接整目录清理，不必做引用计数。
+func (a *App) getUserScriptDepsDir(id string) string {
+	return filepath.Join(a.getUserScriptSourceDir(), id+".deps")
+}
+
+const (
+	// maxScriptAssetSize 限制单个依赖体积。jQuery 约 90KB，此处留足余量。
+	maxScriptAssetSize = 8 << 20 // 8 MiB
+	scriptAssetTimeout = 30 * time.Second
+)
+
+// parseResourceDeclaration 拆解 "@resource 名称 URL" 的声明
+func parseResourceDeclaration(val string) (name, rawURL string, ok bool) {
+	fields := strings.Fields(val)
+	if len(fields) < 2 {
+		return "", "", false
+	}
+	return fields[0], fields[1], true
+}
+
+// scriptAssetFileName 用 URL 的哈希作为文件名。
+// 不使用 URL 路径中的文件名，以避免路径穿越与同名覆盖。
+func scriptAssetFileName(index int, rawURL string) string {
+	sum := sha256.Sum256([]byte(rawURL))
+	ext := ".bin"
+	if parsed, err := url.Parse(rawURL); err == nil {
+		if e := strings.ToLower(filepath.Ext(parsed.Path)); e != "" && len(e) <= 6 && isSafeAssetExt(e) {
+			ext = e
+		}
+	}
+	return fmt.Sprintf("%02d_%x%s", index, sum[:8], ext)
+}
+
+func isSafeAssetExt(ext string) bool {
+	for _, r := range ext[1:] {
+		if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return len(ext) > 1
+}
+
+// fetchScriptAsset 下载单个依赖。仅允许 HTTPS，避免明文链路被篡改后注入代码。
+func fetchScriptAsset(rawURL string) ([]byte, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("地址非法: %w", err)
+	}
+	if parsed.Scheme != "https" {
+		return nil, fmt.Errorf("仅支持 https 依赖，实际为 %q", parsed.Scheme)
+	}
+
+	client := &http.Client{Timeout: scriptAssetTimeout}
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("下载失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("下载失败，状态码 %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxScriptAssetSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+	if len(data) > maxScriptAssetSize {
+		return nil, fmt.Errorf("依赖过大，超过 %d MiB", maxScriptAssetSize>>20)
+	}
+	return data, nil
+}
+
+func (a *App) fetchAsset(rawURL string) ([]byte, error) {
+	if a.assetFetcher != nil {
+		return a.assetFetcher(rawURL)
+	}
+	return fetchScriptAsset(rawURL)
+}
+
+// downloadScriptAssets 下载脚本声明的 @require / @resource 到本地缓存。
+//
+// 单个依赖失败不阻断脚本保存：脚本仍会落盘，但下载数量与声明数量不符，
+// unsupportedScriptFeatures 会据此报告脚本不可用，用户可稍后重试。
+// 已存在且 URL 未变的依赖直接复用，避免每次编辑脚本都重新下载。
+func (a *App) downloadScriptAssets(script *UserScript) {
+	depsDir := a.getUserScriptDepsDir(script.ID)
+	if len(script.Requires) == 0 && len(script.Resources) == 0 {
+		os.RemoveAll(depsDir)
+		script.RequireAssets = nil
+		script.ResourceAssets = nil
+		return
+	}
+
+	if err := os.MkdirAll(depsDir, 0755); err != nil {
+		a.Log("warn", fmt.Sprintf("创建依赖目录失败: %v", err))
+		return
+	}
+
+	existing := make(map[string]string, len(script.RequireAssets)+len(script.ResourceAssets))
+	for _, asset := range append(append([]ScriptAsset{}, script.RequireAssets...), script.ResourceAssets...) {
+		existing[asset.URL] = asset.File
+	}
+
+	fetch := func(index int, name, rawURL string) (ScriptAsset, bool) {
+		fileName := scriptAssetFileName(index, rawURL)
+		target := filepath.Join(depsDir, fileName)
+
+		// URL 未变且文件仍在，直接复用
+		if prev, ok := existing[rawURL]; ok && prev == fileName {
+			if _, err := os.Stat(target); err == nil {
+				return ScriptAsset{Name: name, URL: rawURL, File: fileName}, true
+			}
+		}
+
+		data, err := a.fetchAsset(rawURL)
+		if err != nil {
+			a.Log("warn", fmt.Sprintf("脚本 [%s] 的依赖 %s %v", script.Name, rawURL, err))
+			return ScriptAsset{}, false
+		}
+		if err := os.WriteFile(target, data, 0644); err != nil {
+			a.Log("warn", fmt.Sprintf("写入依赖失败: %v", err))
+			return ScriptAsset{}, false
+		}
+		return ScriptAsset{Name: name, URL: rawURL, File: fileName}, true
+	}
+
+	requireAssets := make([]ScriptAsset, 0, len(script.Requires))
+	for i, rawURL := range script.Requires {
+		if asset, ok := fetch(i, "", rawURL); ok {
+			requireAssets = append(requireAssets, asset)
+		}
+	}
+
+	resourceAssets := make([]ScriptAsset, 0, len(script.Resources))
+	for i, decl := range script.Resources {
+		name, rawURL, ok := parseResourceDeclaration(decl)
+		if !ok {
+			a.Log("warn", fmt.Sprintf("脚本 [%s] 的 @resource 声明格式非法: %q", script.Name, decl))
+			continue
+		}
+		if asset, ok := fetch(1000+i, name, rawURL); ok {
+			resourceAssets = append(resourceAssets, asset)
+		}
+	}
+
+	script.RequireAssets = requireAssets
+	script.ResourceAssets = resourceAssets
+
+	total := len(script.Requires) + len(script.Resources)
+	got := len(requireAssets) + len(resourceAssets)
+	if got == total {
+		a.Log("info", fmt.Sprintf("脚本 [%s] 的 %d 个外部依赖已全部下载", script.Name, total))
+	} else {
+		a.Log("warn", fmt.Sprintf("脚本 [%s] 有 %d/%d 个依赖下载失败，启用后不会正常工作",
+			script.Name, total-got, total))
+	}
+}
+
 func (a *App) loadUserScripts() {
 	data, err := os.ReadFile(a.getUserScriptStoragePath())
 	if err != nil {
@@ -612,7 +791,14 @@ func parseUserScriptMeta(source string) UserScript {
 		case "name":
 			script.Name = val
 		case "description":
+			// @description:zh-CN 等本地化变体的 key 不等于 "description"，会被忽略，此处只取通用描述
 			script.Description = val
+		case "version":
+			script.Version = val
+		case "require":
+			script.Requires = append(script.Requires, val)
+		case "resource":
+			script.Resources = append(script.Resources, val)
 		case "match", "include":
 			// @include 允许 * 与正则等非标准写法，这里只收 Gecko 能接受的，
 			// 其余丢弃以免污染 manifest 导致整个扩展加载失败。
@@ -1140,9 +1326,12 @@ func (a *App) SaveUserScript(id, source string) (UserScript, error) {
 		target.Name = "未命名脚本"
 	}
 	target.Description = parsed.Description
+	target.Version = parsed.Version
 	target.Matches = parsed.Matches
 	target.RunAt = parsed.RunAt
 	target.Grants = parsed.Grants
+	target.Requires = parsed.Requires
+	target.Resources = parsed.Resources
 	// World 由界面开关控制，重新解析正文时不应把用户的选择覆盖掉
 	if target.World == "" {
 		target.World = parsed.World
@@ -1153,6 +1342,9 @@ func (a *App) SaveUserScript(id, source string) (UserScript, error) {
 		return UserScript{}, fmt.Errorf("写入脚本文件失败: %v", err)
 	}
 
+	// 下载 @require / @resource；失败不阻断保存，由兼容性检查汇报
+	a.downloadScriptAssets(target)
+
 	result := *target
 	if err := a.saveUserScripts(); err != nil {
 		return result, err
@@ -1162,7 +1354,57 @@ func (a *App) SaveUserScript(id, source string) (UserScript, error) {
 	if len(result.Matches) == 0 {
 		a.Log("warn", fmt.Sprintf("脚本 [%s] 未解析到合法的 @match 规则，启用后不会生效", result.Name))
 	}
+	if blockers := unsupportedScriptFeatures(result); len(blockers) > 0 {
+		a.Log("warn", fmt.Sprintf("脚本 [%s] 使用了当前引擎尚未支持的能力（%s），启用后不会正常工作",
+			result.Name, strings.Join(blockers, "、")))
+	}
 	return result, nil
+}
+
+// unsupportedScriptFeatures 返回脚本用到、但本引擎不支持的能力。
+//
+// 这些能力缺失会让脚本"安装成功却静默失效"，因此需要在界面上明确告知，
+// 而不是让用户自己去控制台找 "$ is not defined"。
+//
+// 注意：GM_* API 与 @resource 是**刻意不实现**的，不是待办项。
+// 需要它们的多是日常浏览增强脚本，其界面改动在页面上高度可见，与本项目的
+// 反检测目标相悖；且 GM_xmlhttpRequest 需为扩展申请 <all_urls> 跨域权限，
+// 会实质扩大暴露面。详见 .antigravity_docs/plans/userscript_engine_plan.md 第 1.3 节。
+func unsupportedScriptFeatures(script UserScript) []string {
+	var blockers []string
+
+	// @require 已支持，但下载不全时脚本一样跑不起来
+	if missing := len(script.Requires) - len(script.RequireAssets); missing > 0 {
+		blockers = append(blockers, fmt.Sprintf("%d 个 @require 依赖未下载成功", missing))
+	}
+	// @resource 需要 GM_getResourceText / GM_getResourceURL 才能取用，尚未实现
+	if len(script.Resources) > 0 {
+		blockers = append(blockers, fmt.Sprintf("%d 个 @resource 外部资源", len(script.Resources)))
+	}
+	if len(script.Grants) > 0 {
+		blockers = append(blockers, fmt.Sprintf("GM API（%s）", strings.Join(script.Grants, ", ")))
+	}
+	return blockers
+}
+
+// RedownloadScriptAssets 重新下载指定脚本的外部依赖，供下载失败后重试
+func (a *App) RedownloadScriptAssets(id string) (UserScript, error) {
+	for i := range a.userScripts {
+		if a.userScripts[i].ID != id {
+			continue
+		}
+		// 清空既有记录以强制重新拉取，避免命中"复用"分支
+		a.userScripts[i].RequireAssets = nil
+		a.userScripts[i].ResourceAssets = nil
+		a.downloadScriptAssets(&a.userScripts[i])
+
+		result := a.userScripts[i]
+		if err := a.saveUserScripts(); err != nil {
+			return result, err
+		}
+		return result, nil
+	}
+	return UserScript{}, fmt.Errorf("未找到脚本")
 }
 
 // SetUserScriptWorld 设置脚本的运行世界。
@@ -1209,6 +1451,10 @@ func (a *App) DeleteUserScript(id string) error {
 
 	if err := os.Remove(a.getUserScriptSourcePath(id)); err != nil && !os.IsNotExist(err) {
 		a.Log("warn", fmt.Sprintf("删除脚本文件失败: %v", err))
+	}
+	// 依赖按脚本隔离存放，可直接整目录清理
+	if err := os.RemoveAll(a.getUserScriptDepsDir(id)); err != nil {
+		a.Log("warn", fmt.Sprintf("清理依赖缓存失败: %v", err))
 	}
 
 	// 清理各环境的引用，避免留下悬空 ID
@@ -1258,6 +1504,73 @@ func (a *App) SetProfileScripts(profileID string, scriptIDs []string) error {
 		}
 	}
 	return fmt.Errorf("未找到环境")
+}
+
+// maxUserScriptSize 限制单个脚本体积。真实脚本可达数 MB（如 LinkSwift 约 760KB），
+// 此处留出充裕余量，同时避免误拖大文件把界面拖垮。
+const maxUserScriptSize = 16 << 20 // 16 MiB
+
+// ScriptInstallOutcome 描述一个文件的安装结果，供批量拖放时逐个反馈
+type ScriptInstallOutcome struct {
+	FileName    string     `json:"file_name"`
+	OK          bool       `json:"ok"`
+	Error       string     `json:"error"`
+	Script      UserScript `json:"script"`
+	Unsupported []string   `json:"unsupported"` // 当前引擎不支持、会导致脚本失效的能力
+}
+
+// InstallUserScriptsFromPaths 从本地文件路径批量安装脚本，供窗口拖放使用。
+//
+// 单个文件失败不影响其余文件，逐个返回结果由前端汇总提示。
+func (a *App) InstallUserScriptsFromPaths(paths []string) []ScriptInstallOutcome {
+	outcomes := make([]ScriptInstallOutcome, 0, len(paths))
+
+	for _, path := range paths {
+		name := filepath.Base(path)
+		outcome := ScriptInstallOutcome{FileName: name}
+
+		info, err := os.Stat(path)
+		switch {
+		case err != nil:
+			outcome.Error = fmt.Sprintf("无法读取: %v", err)
+		case info.IsDir():
+			outcome.Error = "这是一个文件夹，请拖入脚本文件"
+		case info.Size() > maxUserScriptSize:
+			outcome.Error = fmt.Sprintf("文件过大（%.1f MB），已跳过", float64(info.Size())/(1<<20))
+		case !isLikelyUserScriptFile(name):
+			outcome.Error = "不是脚本文件，仅支持 .user.js / .js / .txt"
+		default:
+			data, readErr := os.ReadFile(path)
+			if readErr != nil {
+				outcome.Error = fmt.Sprintf("读取失败: %v", readErr)
+				break
+			}
+			script, saveErr := a.SaveUserScript("", string(data))
+			if saveErr != nil {
+				outcome.Error = saveErr.Error()
+				break
+			}
+			outcome.OK = true
+			outcome.Script = script
+			outcome.Unsupported = unsupportedScriptFeatures(script)
+		}
+
+		if !outcome.OK && outcome.Error != "" {
+			a.Log("warn", fmt.Sprintf("拖入的文件 [%s] 未能安装: %s", name, outcome.Error))
+		}
+		outcomes = append(outcomes, outcome)
+	}
+
+	return outcomes
+}
+
+// isLikelyUserScriptFile 判断文件名是否可能是用户脚本。
+// 放宽到 .txt 是因为部分站点下载下来的脚本会被浏览器改成该后缀。
+func isLikelyUserScriptFile(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.HasSuffix(lower, ".user.js") ||
+		strings.HasSuffix(lower, ".js") ||
+		strings.HasSuffix(lower, ".txt")
 }
 
 // ImportUserScriptFromFile 从本地 .user.js 文件导入脚本
@@ -2128,19 +2441,38 @@ func (a *App) setupUserScripts(userDataDir string, profile BrowserProfile) error
 			continue
 		}
 
-		payload := string(source)
+		// @require 的库必须在主脚本之前执行，且顺序与声明一致
+		requireSources, reqErr := a.readScriptRequires(s)
+		if reqErr != nil {
+			a.Log("warn", fmt.Sprintf("脚本 [%s] 的依赖缺失，已跳过: %v", s.Name, reqErr))
+			continue
+		}
+
+		jsFiles := make([]string, 0, len(requireSources)+1)
 		if s.World == "page" {
-			payload = wrapForPageWorld(payload)
+			// 主世界模式下 content_scripts 里的文件仍在沙箱执行，
+			// 依赖必须与主脚本拼在一起注入，否则主脚本取不到这些库
+			combined := strings.Join(append(requireSources, string(source)), "\n;\n")
+			source = []byte(wrapForPageWorld(combined))
+		} else {
+			for i, dep := range requireSources {
+				depName := fmt.Sprintf("req_%s_%02d.js", s.ID, i)
+				if err := os.WriteFile(filepath.Join(extDir, depName), []byte(dep), 0644); err != nil {
+					return fmt.Errorf("写入脚本 [%s] 的依赖失败: %w", s.Name, err)
+				}
+				jsFiles = append(jsFiles, depName)
+			}
 		}
 
 		fileName := "us_" + s.ID + ".js"
-		if err := os.WriteFile(filepath.Join(extDir, fileName), []byte(payload), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(extDir, fileName), source, 0644); err != nil {
 			return fmt.Errorf("写入脚本 [%s] 失败: %w", s.Name, err)
 		}
+		jsFiles = append(jsFiles, fileName)
 
 		contentScripts = append(contentScripts, map[string]interface{}{
 			"matches":    validMatches,
-			"js":         []string{fileName},
+			"js":         jsFiles,
 			"run_at":     s.RunAt,
 			"all_frames": false,
 		})
@@ -2173,6 +2505,30 @@ func (a *App) setupUserScripts(userDataDir string, profile BrowserProfile) error
 
 	a.Log("info", fmt.Sprintf("已为环境 [%s] 注入 %d 个用户脚本", profile.Name, len(contentScripts)))
 	return nil
+}
+
+// readScriptRequires 按声明顺序读出该脚本所有 @require 依赖的本地缓存内容。
+//
+// 只要有一个依赖缺失就返回错误：宁可整个脚本不注入，也不注入一个注定报错的半成品。
+func (a *App) readScriptRequires(script UserScript) ([]string, error) {
+	if len(script.Requires) == 0 {
+		return nil, nil
+	}
+	if len(script.RequireAssets) != len(script.Requires) {
+		return nil, fmt.Errorf("声明了 %d 个 @require，仅 %d 个下载成功",
+			len(script.Requires), len(script.RequireAssets))
+	}
+
+	depsDir := a.getUserScriptDepsDir(script.ID)
+	sources := make([]string, 0, len(script.RequireAssets))
+	for _, asset := range script.RequireAssets {
+		data, err := os.ReadFile(filepath.Join(depsDir, asset.File))
+		if err != nil {
+			return nil, fmt.Errorf("依赖 %s 读取失败: %w", asset.URL, err)
+		}
+		sources = append(sources, string(data))
+	}
+	return sources, nil
 }
 
 // wrapForPageWorld 将脚本注入页面主世界，使其可访问页面自身的 JS 变量。
@@ -2569,6 +2925,7 @@ func (a *App) restoreBundledUserScripts(zipReader *zip.Reader) (map[string]strin
 
 	idMap := make(map[string]string, len(index))
 	imported := 0
+	needsAssets := 0
 
 	for _, s := range index {
 		source, ok := sources[s.ID]
@@ -2591,11 +2948,18 @@ func (a *App) restoreBundledUserScripts(zipReader *zip.Reader) (map[string]strin
 		restored.ID = newID
 		restored.Enabled = false
 		restored.UpdatedAt = time.Now().Unix()
+		// 依赖缓存不随环境包携带（都是可重新获取的公共 CDN 资源），
+		// 清空记录后由界面提示用户重新下载，而不是留下指向不存在文件的记录
+		restored.RequireAssets = nil
+		restored.ResourceAssets = nil
 
 		a.userScripts = append(a.userScripts, restored)
 		existingByContent[string(source)] = newID
 		idMap[s.ID] = newID
 		imported++
+		if len(restored.Requires) > 0 || len(restored.Resources) > 0 {
+			needsAssets++
+		}
 	}
 
 	if imported > 0 {
@@ -2604,6 +2968,10 @@ func (a *App) restoreBundledUserScripts(zipReader *zip.Reader) (map[string]strin
 		}
 		a.Log("info", fmt.Sprintf(
 			"环境包内含 %d 个用户脚本，已导入并保持停用，请确认内容后再在脚本页启用", imported))
+		if needsAssets > 0 {
+			a.Log("warn", fmt.Sprintf(
+				"其中 %d 个脚本有外部依赖，需在脚本页点击「重新下载依赖」后才能使用", needsAssets))
+		}
 	}
 
 	return idMap, nil

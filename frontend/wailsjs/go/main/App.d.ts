@@ -12,6 +12,8 @@ export function DeleteProfile(arg1:string):Promise<void>;
 
 export function DeleteProxy(arg1:string):Promise<void>;
 
+export function DeleteUserScript(arg1:string):Promise<void>;
+
 export function ExportCookies(arg1:string):Promise<void>;
 
 export function ExportProfile(arg1:string):Promise<void>;
@@ -32,9 +34,17 @@ export function GetStorageDirectory():Promise<string>;
 
 export function GetStorageMode():Promise<string>;
 
+export function GetUserScriptSource(arg1:string):Promise<string>;
+
+export function GetUserScripts():Promise<Array<main.UserScript>>;
+
 export function ImportCookiesFromFile():Promise<string>;
 
 export function ImportProfile():Promise<void>;
+
+export function ImportUserScriptFromFile():Promise<main.UserScript>;
+
+export function InstallUserScriptsFromPaths(arg1:Array<string>):Promise<Array<main.ScriptInstallOutcome>>;
 
 export function LaunchBrowser(arg1:string,arg2:string):Promise<void>;
 
@@ -44,13 +54,23 @@ export function OpenDataDirectory():Promise<void>;
 
 export function OpenDefaultAppsSettings():Promise<void>;
 
+export function RedownloadScriptAssets(arg1:string):Promise<main.UserScript>;
+
 export function RegisterAsDefaultBrowser():Promise<string>;
 
 export function ResetCookies(arg1:string):Promise<void>;
 
 export function RotateAutomationToken():Promise<string>;
 
+export function SaveUserScript(arg1:string,arg2:string):Promise<main.UserScript>;
+
 export function SetAutomationEnabled(arg1:boolean):Promise<void>;
+
+export function SetProfileScripts(arg1:string,arg2:Array<string>):Promise<void>;
+
+export function SetUserScriptEnabled(arg1:string,arg2:boolean):Promise<void>;
+
+export function SetUserScriptWorld(arg1:string,arg2:string):Promise<void>;
 
 export function StartAutomationSession(arg1:string,arg2:string):Promise<main.AutomationSession>;
 
@@ -67,19 +87,3 @@ export function UnregisterAsDefaultBrowser():Promise<string>;
 export function UpdateProfile(arg1:main.BrowserProfile):Promise<void>;
 
 export function UpdateProxy(arg1:main.ProxyEntry):Promise<void>;
-
-export function DeleteUserScript(arg1:string):Promise<void>;
-
-export function GetUserScriptSource(arg1:string):Promise<string>;
-
-export function GetUserScripts():Promise<Array<main.UserScript>>;
-
-export function ImportUserScriptFromFile():Promise<main.UserScript>;
-
-export function SaveUserScript(arg1:string,arg2:string):Promise<main.UserScript>;
-
-export function SetProfileScripts(arg1:string,arg2:Array<string>):Promise<void>;
-
-export function SetUserScriptEnabled(arg1:string,arg2:boolean):Promise<void>;
-
-export function SetUserScriptWorld(arg1:string,arg2:string):Promise<void>;

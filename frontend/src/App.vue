@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { GetProfiles, LaunchBrowser, UpdateProfile, CreateProfile, DeleteProfile, SyncCookies, ResetCookies, TestProxy, GetProxies, AddProxy, DeleteProxy, TestProxyEntry, ExportCookies, ExportProfile, ImportProfile, ImportCookiesFromFile, RegisterAsDefaultBrowser, OpenDefaultAppsSettings, GetStartupURL, CreateDesktopShortcut, OpenDataDirectory, UnregisterAsDefaultBrowser, GetStorageDirectory, GetStorageMode, GetAutomationInfo, GetAutomationSessions, GetAutomationToken, StartAutomationSession, StopAutomationSession, RotateAutomationToken, SetAutomationEnabled, GetUserScripts, GetUserScriptSource, SaveUserScript, DeleteUserScript, SetUserScriptEnabled, SetUserScriptWorld, SetProfileScripts, ImportUserScriptFromFile } from '../wailsjs/go/main/App'
-import { EventsOn } from '../wailsjs/runtime'
+import { GetProfiles, LaunchBrowser, UpdateProfile, CreateProfile, DeleteProfile, SyncCookies, ResetCookies, TestProxy, GetProxies, AddProxy, DeleteProxy, TestProxyEntry, ExportCookies, ExportProfile, ImportProfile, ImportCookiesFromFile, RegisterAsDefaultBrowser, OpenDefaultAppsSettings, GetStartupURL, CreateDesktopShortcut, OpenDataDirectory, UnregisterAsDefaultBrowser, GetStorageDirectory, GetStorageMode, GetAutomationInfo, GetAutomationSessions, GetAutomationToken, StartAutomationSession, StopAutomationSession, RotateAutomationToken, SetAutomationEnabled, GetUserScripts, GetUserScriptSource, SaveUserScript, DeleteUserScript, SetUserScriptEnabled, SetUserScriptWorld, SetProfileScripts, ImportUserScriptFromFile, InstallUserScriptsFromPaths, RedownloadScriptAssets } from '../wailsjs/go/main/App'
+import { EventsOn, OnFileDrop, OnFileDropOff } from '../wailsjs/runtime'
 
 import { 
   Monitor, 
@@ -40,6 +40,7 @@ const testingProxy = ref(false)
 const currentView = ref('profiles') // 'profiles', 'proxies', 'scripts', 'logs', 'automation'
 
 const userScripts = ref([])
+const isDraggingScript = ref(false)
 const showScriptModal = ref(false)
 const editingScript = ref(null)   // 正在编辑的脚本元数据；null 表示新建
 const scriptSource = ref('')
@@ -937,8 +938,100 @@ const handleImportScript = async () => {
     if (!saved || !saved.id) return
     await fetchUserScripts()
     pushNotice(`已导入脚本「${saved.name}」，请在环境设置中启用。`, 'success', '导入成功')
+    warnIfUnsupported(saved)
   } catch (err) {
     pushNotice(formatErrorMessage(err, '导入脚本失败'), 'error', '导入失败')
+  }
+}
+
+// 与 app.go 的 unsupportedScriptFeatures 保持一致：
+// 脚本"装得上却静默失效"是最糟的体验，必须在界面上显式告知。
+const describeUnsupported = (script) => {
+  if (!script) return []
+  const blockers = []
+
+  // @require 已支持，但下载不全时脚本一样跑不起来
+  const missingRequires = (script.requires?.length || 0) - (script.require_assets?.length || 0)
+  if (missingRequires > 0) blockers.push(`${missingRequires} 个 @require 依赖未下载成功`)
+
+  // @resource 需要 GM_getResourceText 才能取用，尚未实现
+  if (script.resources?.length) blockers.push(`${script.resources.length} 个 @resource 外部资源`)
+  if (script.grants?.length) blockers.push(`GM API（${script.grants.join(', ')}）`)
+  return blockers
+}
+
+// 依赖下载失败可单独重试，不必重新保存整个脚本
+const hasFailedRequires = (script) =>
+  (script.requires?.length || 0) > (script.require_assets?.length || 0)
+
+const handleRedownloadAssets = async (script) => {
+  try {
+    const updated = await RedownloadScriptAssets(script.id)
+    await fetchUserScripts()
+    if (hasFailedRequires(updated)) {
+      pushNotice(`「${updated.name}」仍有依赖下载失败，请检查网络或代理。`, 'error', '下载未完成')
+    } else {
+      pushNotice(`「${updated.name}」的外部依赖已下载完成。`, 'success', '下载成功')
+    }
+  } catch (err) {
+    pushNotice(formatErrorMessage(err, '重新下载依赖失败'), 'error', '下载失败')
+  }
+}
+
+const warnIfUnsupported = (script) => {
+  const blockers = describeUnsupported(script)
+  if (blockers.length === 0) return
+  pushNotice(
+    `「${script.name}」使用了 ${blockers.join('、')}，当前引擎尚未支持，即使启用也不会正常工作。`,
+    'error',
+    '该脚本暂无法运行'
+  )
+}
+
+// 拖放的视觉反馈。Wails 的 OnFileDrop 只在释放时回调，
+// 拖入过程中的高亮仍需借助原生 drag 事件。
+let dragLeaveTimer = null
+
+const handleDragOver = (event) => {
+  event.preventDefault()
+  if (dragLeaveTimer) {
+    clearTimeout(dragLeaveTimer)
+    dragLeaveTimer = null
+  }
+  isDraggingScript.value = true
+}
+
+const handleDragLeave = () => {
+  // dragleave 在子元素间移动时会频繁触发，延迟收起避免闪烁
+  if (dragLeaveTimer) clearTimeout(dragLeaveTimer)
+  dragLeaveTimer = setTimeout(() => {
+    isDraggingScript.value = false
+    dragLeaveTimer = null
+  }, 120)
+}
+
+const handleDroppedFiles = async (paths) => {
+  if (!paths || paths.length === 0) return
+
+  isDraggingScript.value = false
+  try {
+    const outcomes = await InstallUserScriptsFromPaths(paths)
+    await fetchUserScripts()
+
+    const succeeded = outcomes.filter((o) => o.ok)
+    const failed = outcomes.filter((o) => !o.ok)
+
+    if (succeeded.length > 0) {
+      currentView.value = 'scripts'
+      const names = succeeded.map((o) => o.script.name).join('、')
+      pushNotice(`已安装 ${succeeded.length} 个脚本：${names}。请在环境设置中启用。`, 'success', '安装成功')
+      succeeded.forEach((o) => warnIfUnsupported(o.script))
+    }
+    failed.forEach((o) => {
+      pushNotice(`${o.file_name}：${o.error}`, 'error', '安装失败')
+    })
+  } catch (err) {
+    pushNotice(formatErrorMessage(err, '安装拖入的脚本失败'), 'error', '安装失败')
   }
 }
 
@@ -1180,6 +1273,16 @@ onMounted(async () => {
   fetchProxies()
   fetchUserScripts()
   fetchAutomationState()
+
+  // 拖入 .user.js 直接安装。useDropTarget 传 false，窗口内任意位置均可释放。
+  try {
+    OnFileDrop((x, y, paths) => handleDroppedFiles(paths), false)
+    window.addEventListener('dragover', handleDragOver)
+    window.addEventListener('dragleave', handleDragLeave)
+    window.addEventListener('drop', handleDragLeave)
+  } catch (err) {
+    console.warn('注册文件拖放失败:', err)
+  }
   
   // 检查是否有待启动的外部 URL
   try {
@@ -1218,12 +1321,32 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopAutomationPolling()
+
+  if (dragLeaveTimer) clearTimeout(dragLeaveTimer)
+  window.removeEventListener('dragover', handleDragOver)
+  window.removeEventListener('dragleave', handleDragLeave)
+  window.removeEventListener('drop', handleDragLeave)
+  try {
+    OnFileDropOff()
+  } catch (err) {
+    console.warn('注销文件拖放失败:', err)
+  }
 })
 </script>
 
 <template>
   <div class="app-layout" :class="appToneClass">
     <div class="glass-bg"></div>
+
+    <Transition name="fade">
+      <div v-if="isDraggingScript" class="drop-overlay">
+        <div class="drop-card glass">
+          <FileCode :size="42" />
+          <strong>释放以安装用户脚本</strong>
+          <span>支持 .user.js / .js / .txt，可一次拖入多个</span>
+        </div>
+      </div>
+    </Transition>
     <TransitionGroup name="notice-pop" tag="div" class="notice-stack" v-if="notices.length > 0">
       <div v-for="notice in notices" :key="notice.id" class="notice-card" :class="notice.type">
         <div class="notice-copy">
@@ -1540,6 +1663,12 @@ onUnmounted(() => {
               </p>
               <p class="script-intro-tip">
                 在此保存的脚本还需要到对应环境的「环境设置」里勾选启用，重启该环境后生效。
+                也可以把 <b>.user.js</b> 文件直接拖进窗口任意位置安装。
+              </p>
+              <p class="script-intro-tip">
+                支持 <b>@require</b> 外部依赖（保存时自动下载并缓存）。
+                但<b>不支持 GM_* API</b>——这类脚本多为日常浏览增强，其界面改动在页面上高度可见，
+                与本工具的反检测目标相悖。需要它们请使用官方油猴扩展。
               </p>
             </div>
 
@@ -1557,8 +1686,21 @@ onUnmounted(() => {
               <tbody>
                 <tr v-for="s in filteredScripts" :key="s.id">
                   <td>
-                    <div class="script-name">{{ s.name }}</div>
+                    <div class="script-name">
+                      {{ s.name }}
+                      <span v-if="s.version" class="script-version">v{{ s.version }}</span>
+                    </div>
                     <div v-if="s.description" class="script-desc">{{ s.description }}</div>
+                    <div v-if="describeUnsupported(s).length" class="script-blocked">
+                      <ShieldAlert :size="14" />
+                      <span>{{ describeUnsupported(s).join('、') }}，启用后不会正常工作</span>
+                      <button v-if="hasFailedRequires(s)" @click="handleRedownloadAssets(s)" class="btn-inline">
+                        重新下载
+                      </button>
+                    </div>
+                    <div v-else-if="s.require_assets?.length" class="script-deps-ok">
+                      已缓存 {{ s.require_assets.length }} 个外部依赖
+                    </div>
                   </td>
                   <td>
                     <code v-for="m in (s.matches || [])" :key="m" class="script-match">{{ m }}</code>
@@ -2433,6 +2575,17 @@ select option {
 .script-picker-name { flex: 1; }
 .script-picker-tag { font-size: 0.68rem; color: var(--text-dim); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
 .script-picker-tag.warn { color: #fbbf24; border-color: rgba(251, 191, 36, 0.35); }
+.script-version { font-size: 0.68rem; color: var(--text-dim); margin-left: 6px; font-weight: 400; }
+.script-blocked { display: flex; align-items: center; gap: 5px; margin-top: 6px; font-size: 0.72rem; color: #f87171; line-height: 1.5; }
+.script-deps-ok { margin-top: 6px; font-size: 0.72rem; color: var(--text-dim); }
+.btn-inline { background: none; border: 1px solid rgba(248, 113, 113, 0.4); color: #f87171; border-radius: 999px; padding: 1px 10px; font-size: 0.68rem; cursor: pointer; white-space: nowrap; }
+.btn-inline:hover { background: rgba(248, 113, 113, 0.12); }
+
+/* 拖放安装遮罩 */
+.drop-overlay { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center; background: rgba(var(--bg-rgb), 0.72); backdrop-filter: blur(6px); pointer-events: none; }
+.drop-card { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 42px 64px; border-radius: var(--radius-md); border: 2px dashed rgba(var(--primary-rgb), 0.55); color: var(--primary-ink); }
+.drop-card strong { font-size: 1.05rem; }
+.drop-card span { font-size: 0.78rem; color: var(--text-dim); }
 
 .app-layout.tone-proxies .top-bar,
 .app-layout.tone-automation .top-bar,

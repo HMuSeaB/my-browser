@@ -22,6 +22,10 @@ export function DeleteProxy(arg1) {
   return window['go']['main']['App']['DeleteProxy'](arg1);
 }
 
+export function DeleteUserScript(arg1) {
+  return window['go']['main']['App']['DeleteUserScript'](arg1);
+}
+
 export function ExportCookies(arg1) {
   return window['go']['main']['App']['ExportCookies'](arg1);
 }
@@ -62,12 +66,28 @@ export function GetStorageMode() {
   return window['go']['main']['App']['GetStorageMode']();
 }
 
+export function GetUserScriptSource(arg1) {
+  return window['go']['main']['App']['GetUserScriptSource'](arg1);
+}
+
+export function GetUserScripts() {
+  return window['go']['main']['App']['GetUserScripts']();
+}
+
 export function ImportCookiesFromFile() {
   return window['go']['main']['App']['ImportCookiesFromFile']();
 }
 
 export function ImportProfile() {
   return window['go']['main']['App']['ImportProfile']();
+}
+
+export function ImportUserScriptFromFile() {
+  return window['go']['main']['App']['ImportUserScriptFromFile']();
+}
+
+export function InstallUserScriptsFromPaths(arg1) {
+  return window['go']['main']['App']['InstallUserScriptsFromPaths'](arg1);
 }
 
 export function LaunchBrowser(arg1, arg2) {
@@ -86,6 +106,10 @@ export function OpenDefaultAppsSettings() {
   return window['go']['main']['App']['OpenDefaultAppsSettings']();
 }
 
+export function RedownloadScriptAssets(arg1) {
+  return window['go']['main']['App']['RedownloadScriptAssets'](arg1);
+}
+
 export function RegisterAsDefaultBrowser() {
   return window['go']['main']['App']['RegisterAsDefaultBrowser']();
 }
@@ -98,8 +122,24 @@ export function RotateAutomationToken() {
   return window['go']['main']['App']['RotateAutomationToken']();
 }
 
+export function SaveUserScript(arg1, arg2) {
+  return window['go']['main']['App']['SaveUserScript'](arg1, arg2);
+}
+
 export function SetAutomationEnabled(arg1) {
   return window['go']['main']['App']['SetAutomationEnabled'](arg1);
+}
+
+export function SetProfileScripts(arg1, arg2) {
+  return window['go']['main']['App']['SetProfileScripts'](arg1, arg2);
+}
+
+export function SetUserScriptEnabled(arg1, arg2) {
+  return window['go']['main']['App']['SetUserScriptEnabled'](arg1, arg2);
+}
+
+export function SetUserScriptWorld(arg1, arg2) {
+  return window['go']['main']['App']['SetUserScriptWorld'](arg1, arg2);
 }
 
 export function StartAutomationSession(arg1, arg2) {
@@ -132,36 +172,4 @@ export function UpdateProfile(arg1) {
 
 export function UpdateProxy(arg1) {
   return window['go']['main']['App']['UpdateProxy'](arg1);
-}
-
-export function DeleteUserScript(arg1) {
-  return window['go']['main']['App']['DeleteUserScript'](arg1);
-}
-
-export function GetUserScriptSource(arg1) {
-  return window['go']['main']['App']['GetUserScriptSource'](arg1);
-}
-
-export function GetUserScripts() {
-  return window['go']['main']['App']['GetUserScripts']();
-}
-
-export function ImportUserScriptFromFile() {
-  return window['go']['main']['App']['ImportUserScriptFromFile']();
-}
-
-export function SaveUserScript(arg1, arg2) {
-  return window['go']['main']['App']['SaveUserScript'](arg1, arg2);
-}
-
-export function SetProfileScripts(arg1, arg2) {
-  return window['go']['main']['App']['SetProfileScripts'](arg1, arg2);
-}
-
-export function SetUserScriptEnabled(arg1, arg2) {
-  return window['go']['main']['App']['SetUserScriptEnabled'](arg1, arg2);
-}
-
-export function SetUserScriptWorld(arg1, arg2) {
-  return window['go']['main']['App']['SetUserScriptWorld'](arg1, arg2);
 }
