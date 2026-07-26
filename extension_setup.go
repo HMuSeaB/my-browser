@@ -31,6 +31,22 @@ func (a *App) SetExtensionEnabled(id string, enabled bool) error {
 	return fmt.Errorf("未找到扩展")
 }
 
+// SetExtensionPinned 设置图标是固定在地址栏旁，还是收进拼图面板。
+// 该设置写在 profile 副本的 manifest 里，需重启环境生效。
+func (a *App) SetExtensionPinned(id string, pinned bool) error {
+	for i := range a.extensions {
+		if a.extensions[i].ID != id {
+			continue
+		}
+		if !a.extensions[i].HasPopup {
+			return fmt.Errorf("该扩展没有弹窗界面，无法固定到工具栏")
+		}
+		a.extensions[i].Pinned = pinned
+		return a.saveExtensions()
+	}
+	return fmt.Errorf("未找到扩展")
+}
+
 // DeleteExtension 卸载扩展，并清理各环境中对它的引用
 func (a *App) DeleteExtension(id string) error {
 	found := false
@@ -253,7 +269,8 @@ func (a *App) setupExtensions(userDataDir string, profile BrowserProfile) error 
 
 	for _, ext := range enabled {
 		target := filepath.Join(extRoot, ext.GeckoID)
-		stamp := fmt.Sprintf("%s|%s|%d", ext.ID, ext.Version, ext.InstalledAt)
+		// 固定位置写在 manifest 里，改动后必须重铺，故并入指纹
+		stamp := fmt.Sprintf("%s|%s|%d|pinned=%t", ext.ID, ext.Version, ext.InstalledAt, ext.Pinned)
 
 		if current, err := os.ReadFile(filepath.Join(target, extensionStampFile)); err == nil {
 			if string(current) == stamp {
@@ -274,10 +291,8 @@ func (a *App) setupExtensions(userDataDir string, profile BrowserProfile) error 
 			return fmt.Errorf("铺设扩展 [%s] 失败: %w", ext.Name, err)
 		}
 
-		if ext.GeckoIDInjected {
-			if err := injectGeckoID(target, ext.GeckoID); err != nil {
-				a.Log("warn", fmt.Sprintf("为扩展 [%s] 注入 ID 失败: %v", ext.Name, err))
-			}
+		if err := patchProfileManifest(target, ext); err != nil {
+			a.Log("warn", fmt.Sprintf("调整扩展 [%s] 的 manifest 失败: %v", ext.Name, err))
 		}
 
 		if err := os.WriteFile(filepath.Join(target, extensionStampFile), []byte(stamp), 0644); err != nil {
@@ -289,11 +304,13 @@ func (a *App) setupExtensions(userDataDir string, profile BrowserProfile) error 
 	return nil
 }
 
-// injectGeckoID 往 profile 副本的 manifest 中补入 Firefox 扩展 ID。
+// patchProfileManifest 调整写入 profile 的那份 manifest：
+//   - 原 manifest 未声明扩展 ID 时补入（Firefox 装入 profile 必须有显式 ID）
+//   - 按需设置图标落位（nav-bar 直接可见，默认收进拼图面板）
 //
-// 只改这一份副本；<dataDir>/extensions/ 下的原始文件保持不变。
+// 只改这一份副本；用户的原始文件夹与 <dataDir>/extensions/ 下的副本均保持不变。
 // 用 map 解析以保留所有未知字段，避免重写时丢失内容。
-func injectGeckoID(extDir, geckoID string) error {
+func patchProfileManifest(extDir string, ext BrowserExtension) error {
 	path := filepath.Join(extDir, "manifest.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -305,20 +322,37 @@ func injectGeckoID(extDir, geckoID string) error {
 		return fmt.Errorf("manifest 解析失败: %w", err)
 	}
 
-	settings, ok := manifest["browser_specific_settings"].(map[string]interface{})
-	if !ok {
-		settings = map[string]interface{}{}
+	if ext.GeckoIDInjected {
+		settings, ok := manifest["browser_specific_settings"].(map[string]interface{})
+		if !ok {
+			settings = map[string]interface{}{}
+		}
+		gecko, ok := settings["gecko"].(map[string]interface{})
+		if !ok {
+			gecko = map[string]interface{}{}
+		}
+		gecko["id"] = ext.GeckoID
+		if _, exists := gecko["strict_min_version"]; !exists {
+			gecko["strict_min_version"] = "115.0"
+		}
+		settings["gecko"] = gecko
+		manifest["browser_specific_settings"] = settings
 	}
-	gecko, ok := settings["gecko"].(map[string]interface{})
-	if !ok {
-		gecko = map[string]interface{}{}
+
+	// 实测：不设 default_area 时图标落在 unified-extensions-area（拼图面板），
+	// 设为 navbar 则直接出现在地址栏旁边。
+	if ext.HasPopup {
+		area := "menupanel"
+		if ext.Pinned {
+			area = "navbar"
+		}
+		for _, key := range []string{"action", "browser_action"} {
+			if section, ok := manifest[key].(map[string]interface{}); ok {
+				section["default_area"] = area
+				manifest[key] = section
+			}
+		}
 	}
-	gecko["id"] = geckoID
-	if _, exists := gecko["strict_min_version"]; !exists {
-		gecko["strict_min_version"] = "115.0"
-	}
-	settings["gecko"] = gecko
-	manifest["browser_specific_settings"] = settings
 
 	patched, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {

@@ -54,6 +54,8 @@ export function InstallExtensionFromDirectoryDialog():Promise<main.BrowserExtens
 
 export function InstallExtensionFromPath(arg1:string):Promise<main.BrowserExtension>;
 
+export function InstallFromDroppedPaths(arg1:Array<string>):Promise<Array<main.DropOutcome>>;
+
 export function InstallUserScriptsFromPaths(arg1:Array<string>):Promise<Array<main.ScriptInstallOutcome>>;
 
 export function LaunchBrowser(arg1:string,arg2:string):Promise<void>;
@@ -78,6 +80,8 @@ export function SetAutomationEnabled(arg1:boolean):Promise<void>;
 
 export function SetExtensionEnabled(arg1:string,arg2:boolean):Promise<void>;
 
+export function SetExtensionPinned(arg1:string,arg2:boolean):Promise<void>;
+
 export function SetProfileExtensions(arg1:string,arg2:Array<string>):Promise<void>;
 
 export function SetProfileScripts(arg1:string,arg2:Array<string>):Promise<void>;
@@ -101,5 +105,3 @@ export function UnregisterAsDefaultBrowser():Promise<string>;
 export function UpdateProfile(arg1:main.BrowserProfile):Promise<void>;
 
 export function UpdateProxy(arg1:main.ProxyEntry):Promise<void>;
-
-export function InstallFromDroppedPaths(arg1:Array<string>):Promise<Array<main.DropOutcome>>;

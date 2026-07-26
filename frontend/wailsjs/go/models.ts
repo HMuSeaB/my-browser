@@ -68,6 +68,7 @@ export namespace main {
 	    permissions: string[];
 	    host_permissions: string[];
 	    incompatible: string[];
+	    pinned: boolean;
 	    enabled: boolean;
 	    installed_at: number;
 	
@@ -88,6 +89,7 @@ export namespace main {
 	        this.permissions = source["permissions"];
 	        this.host_permissions = source["host_permissions"];
 	        this.incompatible = source["incompatible"];
+	        this.pinned = source["pinned"];
 	        this.enabled = source["enabled"];
 	        this.installed_at = source["installed_at"];
 	    }
@@ -131,11 +133,11 @@ export namespace main {
 	    error: string;
 	    name: string;
 	    unsupported: string[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new DropOutcome(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.file_name = source["file_name"];

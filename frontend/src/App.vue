@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { GetProfiles, LaunchBrowser, UpdateProfile, CreateProfile, DeleteProfile, SyncCookies, ResetCookies, TestProxy, GetProxies, AddProxy, DeleteProxy, TestProxyEntry, ExportCookies, ExportProfile, ImportProfile, ImportCookiesFromFile, RegisterAsDefaultBrowser, OpenDefaultAppsSettings, GetStartupURL, CreateDesktopShortcut, OpenDataDirectory, UnregisterAsDefaultBrowser, GetStorageDirectory, GetStorageMode, GetAutomationInfo, GetAutomationSessions, GetAutomationToken, StartAutomationSession, StopAutomationSession, RotateAutomationToken, SetAutomationEnabled, GetUserScripts, GetUserScriptSource, SaveUserScript, DeleteUserScript, SetUserScriptEnabled, SetUserScriptWorld, SetProfileScripts, ImportUserScriptFromFile, InstallUserScriptsFromPaths, RedownloadScriptAssets,
 GetExtensions, InstallFromDroppedPaths, InstallExtensionFromDialog, InstallExtensionFromDirectoryDialog,
-SetExtensionEnabled, DeleteExtension, SetProfileExtensions } from '../wailsjs/go/main/App'
+SetExtensionEnabled, SetExtensionPinned, DeleteExtension, SetProfileExtensions } from '../wailsjs/go/main/App'
 import { EventsOn, OnFileDrop, OnFileDropOff } from '../wailsjs/runtime'
 
 import { 
@@ -1122,6 +1122,19 @@ const handleToggleExtension = async (ext) => {
   }
 }
 
+const handleTogglePinned = async (ext) => {
+  try {
+    await SetExtensionPinned(ext.id, !ext.pinned)
+    await fetchExtensions()
+    pushNotice(
+      ext.pinned ? '已改为收进拼图面板，重启环境后生效。' : '已固定到地址栏旁，重启环境后生效。',
+      'info', '图标位置已更新'
+    )
+  } catch (err) {
+    pushNotice(formatErrorMessage(err, '调整图标位置失败'), 'error', '操作失败')
+  }
+}
+
 const handleDeleteExtension = async (ext) => {
   if (!confirm(`确定卸载扩展「${ext.name}」？所有环境中对它的启用也会一并清除。`)) return
   try {
@@ -1863,7 +1876,7 @@ onUnmounted(() => {
                 <b>原始文件不会被修改</b>——Firefox 所需的扩展 ID 只在写入环境时补入副本。
               </p>
               <p class="script-intro-tip">
-                启用后重启环境生效。装好的扩展会出现在浏览器工具栏的拼图图标里，点击即可打开它的弹窗界面。
+                启用后重启环境生效。带弹窗的扩展默认<b>固定在地址栏旁</b>，点「图标位置」可改为收进拼图面板。
               </p>
               <p class="script-intro-tip">
                 浏览器的扩展管理页会提示「could not be verified」，这是未经 Mozilla 签名的正常表现，
@@ -1881,7 +1894,7 @@ onUnmounted(() => {
                   <th>名称</th>
                   <th>版本</th>
                   <th>权限</th>
-                  <th>弹窗</th>
+                  <th>图标位置</th>
                   <th>启用</th>
                   <th>操作</th>
                 </tr>
@@ -1911,7 +1924,17 @@ onUnmounted(() => {
                     <span v-if="!(e.permissions || []).length && !(e.host_permissions || []).length"
                           class="script-desc">无</span>
                   </td>
-                  <td>{{ e.has_popup ? '有' : '—' }}</td>
+                  <td>
+                    <button
+                      v-if="e.has_popup"
+                      @click="handleTogglePinned(e)"
+                      class="btn-inline pin"
+                      :class="{ active: e.pinned }"
+                    >
+                      {{ e.pinned ? '地址栏旁' : '拼图面板' }}
+                    </button>
+                    <span v-else class="script-desc">无弹窗</span>
+                  </td>
                   <td>
                     <button
                       @click="handleToggleExtension(e)"
@@ -2799,6 +2822,9 @@ select option {
 .script-deps-ok { margin-top: 6px; font-size: 0.72rem; color: var(--text-dim); }
 .btn-inline { background: none; border: 1px solid rgba(248, 113, 113, 0.4); color: #f87171; border-radius: 999px; padding: 1px 10px; font-size: 0.68rem; cursor: pointer; white-space: nowrap; }
 .btn-inline:hover { background: rgba(248, 113, 113, 0.12); }
+.btn-inline.pin { border-color: var(--border); color: var(--text-dim); }
+.btn-inline.pin:hover { background: rgba(255,255,255,0.06); }
+.btn-inline.pin.active { color: var(--primary-ink); border-color: rgba(var(--primary-rgb), 0.4); background: var(--primary-surface); }
 
 /* 拖放安装遮罩 */
 .drop-overlay { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center; background: rgba(var(--bg-rgb), 0.72); backdrop-filter: blur(6px); pointer-events: none; }

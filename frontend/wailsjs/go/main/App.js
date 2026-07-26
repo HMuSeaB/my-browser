@@ -106,6 +106,10 @@ export function InstallExtensionFromPath(arg1) {
   return window['go']['main']['App']['InstallExtensionFromPath'](arg1);
 }
 
+export function InstallFromDroppedPaths(arg1) {
+  return window['go']['main']['App']['InstallFromDroppedPaths'](arg1);
+}
+
 export function InstallUserScriptsFromPaths(arg1) {
   return window['go']['main']['App']['InstallUserScriptsFromPaths'](arg1);
 }
@@ -154,6 +158,10 @@ export function SetExtensionEnabled(arg1, arg2) {
   return window['go']['main']['App']['SetExtensionEnabled'](arg1, arg2);
 }
 
+export function SetExtensionPinned(arg1, arg2) {
+  return window['go']['main']['App']['SetExtensionPinned'](arg1, arg2);
+}
+
 export function SetProfileExtensions(arg1, arg2) {
   return window['go']['main']['App']['SetProfileExtensions'](arg1, arg2);
 }
@@ -200,8 +208,4 @@ export function UpdateProfile(arg1) {
 
 export function UpdateProxy(arg1) {
   return window['go']['main']['App']['UpdateProxy'](arg1);
-}
-
-export function InstallFromDroppedPaths(arg1) {
-  return window['go']['main']['App']['InstallFromDroppedPaths'](arg1);
 }

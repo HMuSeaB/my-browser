@@ -33,8 +33,11 @@ type BrowserExtension struct {
 	HostPermissions []string `json:"host_permissions"`
 	// Incompatible 记录 Firefox 不支持的特征，装上也不会正常工作
 	Incompatible []string `json:"incompatible"`
-	Enabled      bool     `json:"enabled"`
-	InstalledAt  int64    `json:"installed_at"`
+	// Pinned 决定图标是直接放在地址栏旁（nav-bar），还是收进拼图面板
+	// （unified-extensions-area）。实测由 manifest 的 action.default_area 控制。
+	Pinned      bool  `json:"pinned"`
+	Enabled     bool  `json:"enabled"`
+	InstalledAt int64 `json:"installed_at"`
 }
 
 // --- 存储 ---
@@ -300,6 +303,8 @@ func (a *App) InstallExtensionFromPath(sourcePath string) (BrowserExtension, err
 			}
 		}
 	}
+	// 有弹窗的扩展就是给人点的，默认固定到地址栏旁；没有弹窗则收进拼图面板
+	ext.Pinned = ext.HasPopup
 
 	// Firefox 安装到 profile 的扩展必须有显式 ID；缺失时由我们生成，
 	// 但只在生成到 profile 的副本里注入，原始副本保持不变

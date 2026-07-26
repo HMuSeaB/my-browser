@@ -147,12 +147,92 @@ func TestSetupExtensionsInjectsGeckoIDIntoProfileCopyOnly(t *testing.T) {
 	if manifest["minimum_chrome_version"] != "102" {
 		t.Error("重写 manifest 时丢失了原有字段")
 	}
-	if action, ok := manifest["action"].(map[string]interface{}); !ok || action["default_popup"] != "popup.html" {
-		t.Error("重写 manifest 时丢失了 action 段")
+	action, ok := manifest["action"].(map[string]interface{})
+	if !ok || action["default_popup"] != "popup.html" {
+		t.Fatal("重写 manifest 时丢失了 action 段")
+	}
+	// 有弹窗的扩展默认固定到地址栏旁，实测由 default_area 控制
+	if action["default_area"] != "navbar" {
+		t.Errorf("默认应固定到 navbar，实际 = %v", action["default_area"])
 	}
 	// 其它文件应一并铺好
 	if _, err := os.Stat(filepath.Join(target, "popup.html")); err != nil {
 		t.Errorf("popup.html 未铺设: %v", err)
+	}
+}
+
+// 取消固定后应落回拼图面板，且该改动要能触发 profile 副本重铺
+func TestSetExtensionPinnedRewritesProfileCopy(t *testing.T) {
+	app := &App{dataDir: t.TempDir()}
+	src := filepath.Join(t.TempDir(), "sepa-ext")
+	writeExtensionDir(t, src, sepaManifest)
+
+	ext, err := app.InstallExtensionFromPath(src)
+	if err != nil {
+		t.Fatalf("安装失败: %v", err)
+	}
+	if !ext.Pinned {
+		t.Fatal("有弹窗的扩展应默认固定")
+	}
+	if err := app.SetExtensionEnabled(ext.ID, true); err != nil {
+		t.Fatalf("启用失败: %v", err)
+	}
+
+	userDataDir := t.TempDir()
+	profile := BrowserProfile{ID: "p1", EnabledExtensions: []string{ext.ID}}
+	if err := app.setupExtensions(userDataDir, profile); err != nil {
+		t.Fatalf("首次铺设失败: %v", err)
+	}
+
+	readArea := func() interface{} {
+		data, err := os.ReadFile(filepath.Join(userDataDir, "extensions", ext.GeckoID, "manifest.json"))
+		if err != nil {
+			t.Fatalf("读取 profile 副本失败: %v", err)
+		}
+		var m map[string]interface{}
+		if err := json.Unmarshal(data, &m); err != nil {
+			t.Fatalf("解析失败: %v", err)
+		}
+		action, _ := m["action"].(map[string]interface{})
+		return action["default_area"]
+	}
+
+	if got := readArea(); got != "navbar" {
+		t.Errorf("固定时应为 navbar，实际 %v", got)
+	}
+
+	// 取消固定并重铺：指纹含 pinned，应触发重写而非跳过
+	if err := app.SetExtensionPinned(ext.ID, false); err != nil {
+		t.Fatalf("取消固定失败: %v", err)
+	}
+	if err := app.setupExtensions(userDataDir, profile); err != nil {
+		t.Fatalf("二次铺设失败: %v", err)
+	}
+	if got := readArea(); got != "menupanel" {
+		t.Errorf("取消固定后应为 menupanel，实际 %v", got)
+	}
+}
+
+// 无弹窗的扩展没有可点的图标，不应允许固定
+func TestSetExtensionPinnedRejectsPopuplessExtension(t *testing.T) {
+	app := &App{dataDir: t.TempDir()}
+	src := filepath.Join(t.TempDir(), "no-popup")
+	writeExtensionDir(t, src, `{
+	  "manifest_version": 3,
+	  "name": "No Popup",
+	  "version": "1.0",
+	  "permissions": ["storage"]
+	}`)
+
+	ext, err := app.InstallExtensionFromPath(src)
+	if err != nil {
+		t.Fatalf("安装失败: %v", err)
+	}
+	if ext.HasPopup || ext.Pinned {
+		t.Fatal("无 action 的扩展不应识别为有弹窗或被固定")
+	}
+	if err := app.SetExtensionPinned(ext.ID, true); err == nil {
+		t.Error("无弹窗的扩展应拒绝固定")
 	}
 }
 
