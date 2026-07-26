@@ -133,3 +133,35 @@ export function UpdateProfile(arg1) {
 export function UpdateProxy(arg1) {
   return window['go']['main']['App']['UpdateProxy'](arg1);
 }
+
+export function DeleteUserScript(arg1) {
+  return window['go']['main']['App']['DeleteUserScript'](arg1);
+}
+
+export function GetUserScriptSource(arg1) {
+  return window['go']['main']['App']['GetUserScriptSource'](arg1);
+}
+
+export function GetUserScripts() {
+  return window['go']['main']['App']['GetUserScripts']();
+}
+
+export function ImportUserScriptFromFile() {
+  return window['go']['main']['App']['ImportUserScriptFromFile']();
+}
+
+export function SaveUserScript(arg1, arg2) {
+  return window['go']['main']['App']['SaveUserScript'](arg1, arg2);
+}
+
+export function SetProfileScripts(arg1, arg2) {
+  return window['go']['main']['App']['SetProfileScripts'](arg1, arg2);
+}
+
+export function SetUserScriptEnabled(arg1, arg2) {
+  return window['go']['main']['App']['SetUserScriptEnabled'](arg1, arg2);
+}
+
+export function SetUserScriptWorld(arg1, arg2) {
+  return window['go']['main']['App']['SetUserScriptWorld'](arg1, arg2);
+}

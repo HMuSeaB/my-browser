@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { GetProfiles, LaunchBrowser, UpdateProfile, CreateProfile, DeleteProfile, SyncCookies, ResetCookies, TestProxy, GetProxies, AddProxy, DeleteProxy, TestProxyEntry, ExportCookies, ExportProfile, ImportProfile, ImportCookiesFromFile, RegisterAsDefaultBrowser, OpenDefaultAppsSettings, GetStartupURL, CreateDesktopShortcut, OpenDataDirectory, UnregisterAsDefaultBrowser, GetStorageDirectory, GetStorageMode, GetAutomationInfo, GetAutomationSessions, GetAutomationToken, StartAutomationSession, StopAutomationSession, RotateAutomationToken, SetAutomationEnabled } from '../wailsjs/go/main/App'
+import { GetProfiles, LaunchBrowser, UpdateProfile, CreateProfile, DeleteProfile, SyncCookies, ResetCookies, TestProxy, GetProxies, AddProxy, DeleteProxy, TestProxyEntry, ExportCookies, ExportProfile, ImportProfile, ImportCookiesFromFile, RegisterAsDefaultBrowser, OpenDefaultAppsSettings, GetStartupURL, CreateDesktopShortcut, OpenDataDirectory, UnregisterAsDefaultBrowser, GetStorageDirectory, GetStorageMode, GetAutomationInfo, GetAutomationSessions, GetAutomationToken, StartAutomationSession, StopAutomationSession, RotateAutomationToken, SetAutomationEnabled, GetUserScripts, GetUserScriptSource, SaveUserScript, DeleteUserScript, SetUserScriptEnabled, SetUserScriptWorld, SetProfileScripts, ImportUserScriptFromFile } from '../wailsjs/go/main/App'
 import { EventsOn } from '../wailsjs/runtime'
 
 import { 
@@ -22,7 +22,9 @@ import {
   Sun,
   Moon,
   Palette,
-  Search
+  Search,
+  FileCode,
+  ShieldAlert
 } from 'lucide-vue-next'
 const profiles = ref([])
 const loading = ref(true)
@@ -35,7 +37,23 @@ const editingProfile = ref(null)
 const cookieJson = ref('')
 const proxyTestResult = ref('')
 const testingProxy = ref(false)
-const currentView = ref('profiles') // 'profiles', 'proxies', 'logs'
+const currentView = ref('profiles') // 'profiles', 'proxies', 'scripts', 'logs', 'automation'
+
+const userScripts = ref([])
+const showScriptModal = ref(false)
+const editingScript = ref(null)   // 正在编辑的脚本元数据；null 表示新建
+const scriptSource = ref('')
+const savingScript = ref(false)
+
+const SCRIPT_TEMPLATE = `// ==UserScript==
+// @name        新脚本
+// @description 描述这个脚本做什么
+// @match       https://example.com/*
+// @run-at      document-end
+// ==/UserScript==
+
+console.log('Hello from MyBrowser');
+`
 
 const proxies = ref([])
 const logs = ref([])
@@ -186,10 +204,28 @@ const existingProfileCategories = computed(() => {
 const searchPlaceholder = computed(() => {
   if (currentView.value === 'profiles') return '搜索环境名称、ID、分类、代理或默认页...'
   if (currentView.value === 'proxies') return '搜索代理名称、地址或状态...'
+  if (currentView.value === 'scripts') return '搜索脚本名称、描述或匹配规则...'
   if (currentView.value === 'automation') return '搜索会话名称、ID、端口或连接地址...'
   if (currentView.value === 'logs') return '搜索日志级别或内容...'
   return '搜索内容...'
 })
+
+const filteredScripts = computed(() => {
+  if (!normalizedSearchQuery.value) return userScripts.value
+  return userScripts.value.filter((s) => {
+    const haystack = [s.name, s.description, (s.matches || []).join(' ')]
+      .join(' ').toLowerCase()
+    return haystack.includes(normalizedSearchQuery.value)
+  })
+})
+
+const enabledScriptCount = computed(() => userScripts.value.filter((s) => s.enabled).length)
+
+// page 模式会在页面留下可被检测的痕迹，单独统计以便在概览提示
+const pageWorldScriptCount = computed(
+  () => userScripts.value.filter((s) => s.enabled && s.world === 'page').length
+)
+
 
 const filteredProfiles = computed(() => {
   if (!normalizedSearchQuery.value) return profiles.value
@@ -310,6 +346,7 @@ const runningAutomationCount = computed(() => automationSessions.value.filter((s
 const currentViewTitle = computed(() => {
   if (currentView.value === 'profiles') return detailProfile.value ? '环境详情' : '环境'
   if (currentView.value === 'proxies') return '代理'
+  if (currentView.value === 'scripts') return '脚本'
   if (currentView.value === 'automation') return '自动化'
   if (currentView.value === 'logs') return '日志'
   return '工作台'
@@ -321,6 +358,7 @@ const currentViewDescription = computed(() => {
     return '管理浏览环境、默认页和 Cookie 状态'
   }
   if (currentView.value === 'proxies') return '维护代理池并检查连通性'
+  if (currentView.value === 'scripts') return '管理用户脚本，并在各环境的设置中按需启用'
   if (currentView.value === 'automation') return '查看本地 API、会话状态和接入示例'
   if (currentView.value === 'logs') return '跟踪运行日志和最近事件'
   return ''
@@ -345,6 +383,14 @@ const currentViewStats = computed(() => {
     return [
       { label: '代理', value: `${filteredProxies.value.length}/${proxies.value.length}` },
       { label: '在线', value: String(onlineProxyCount.value) },
+    ]
+  }
+
+  if (currentView.value === 'scripts') {
+    return [
+      { label: '脚本', value: `${filteredScripts.value.length}/${userScripts.value.length}` },
+      { label: '已启用', value: String(enabledScriptCount.value) },
+      { label: '主世界注入', value: String(pageWorldScriptCount.value) },
     ]
   }
 
@@ -838,6 +884,110 @@ const saveSettings = async () => {
   }
 }
 
+// --- 用户脚本 ---
+
+const fetchUserScripts = async () => {
+  try {
+    userScripts.value = (await GetUserScripts()) || []
+  } catch (err) {
+    pushNotice(formatErrorMessage(err, '加载脚本列表失败'), 'error', '加载失败')
+  }
+}
+
+const openScriptEditor = async (script = null) => {
+  editingScript.value = script
+  if (script) {
+    try {
+      scriptSource.value = await GetUserScriptSource(script.id)
+    } catch (err) {
+      pushNotice(formatErrorMessage(err, '读取脚本内容失败'), 'error', '读取失败')
+      return
+    }
+  } else {
+    scriptSource.value = SCRIPT_TEMPLATE
+  }
+  showScriptModal.value = true
+}
+
+const handleSaveScript = async () => {
+  savingScript.value = true
+  try {
+    const saved = await SaveUserScript(editingScript.value?.id || '', scriptSource.value)
+    showScriptModal.value = false
+    await fetchUserScripts()
+    if (!saved.matches || saved.matches.length === 0) {
+      pushNotice(
+        '未解析到合法的 @match 规则，该脚本即使启用也不会生效。',
+        'error',
+        '缺少匹配规则'
+      )
+    } else {
+      pushNotice(`脚本「${saved.name}」已保存。`, 'success', '保存成功')
+    }
+  } catch (err) {
+    pushNotice(formatErrorMessage(err, '保存脚本失败'), 'error', '保存失败')
+  } finally {
+    savingScript.value = false
+  }
+}
+
+const handleImportScript = async () => {
+  try {
+    const saved = await ImportUserScriptFromFile()
+    if (!saved || !saved.id) return
+    await fetchUserScripts()
+    pushNotice(`已导入脚本「${saved.name}」，请在环境设置中启用。`, 'success', '导入成功')
+  } catch (err) {
+    pushNotice(formatErrorMessage(err, '导入脚本失败'), 'error', '导入失败')
+  }
+}
+
+const handleToggleScript = async (script) => {
+  try {
+    await SetUserScriptEnabled(script.id, !script.enabled)
+    await fetchUserScripts()
+  } catch (err) {
+    pushNotice(formatErrorMessage(err, '切换启用状态失败'), 'error', '操作失败')
+  }
+}
+
+const handleChangeScriptWorld = async (script, world) => {
+  try {
+    await SetUserScriptWorld(script.id, world)
+    await fetchUserScripts()
+    if (world === 'page') {
+      pushNotice(
+        '主世界注入会在页面上留下可被检测的痕迹，仅在脚本需要读写页面 JS 变量时使用。',
+        'error',
+        '暴露面提醒'
+      )
+    }
+  } catch (err) {
+    pushNotice(formatErrorMessage(err, '切换运行模式失败'), 'error', '操作失败')
+  }
+}
+
+const handleDeleteScript = async (script) => {
+  if (!confirm(`确定删除脚本「${script.name}」？所有环境中对它的启用也会一并清除。`)) return
+  try {
+    await DeleteUserScript(script.id)
+    await fetchUserScripts()
+    await fetchProfiles()
+    pushNotice('脚本已删除。', 'success', '删除成功')
+  } catch (err) {
+    pushNotice(formatErrorMessage(err, '删除脚本失败'), 'error', '删除失败')
+  }
+}
+
+// 环境设置弹窗内的启用清单：直接改本地副本，随"保存变更"一起提交
+const toggleScriptForEditingProfile = (scriptId) => {
+  if (!editingProfile.value) return
+  const list = editingProfile.value.enabled_scripts || []
+  editingProfile.value.enabled_scripts = list.includes(scriptId)
+    ? list.filter((id) => id !== scriptId)
+    : [...list, scriptId]
+}
+
 const handleTestProxy = async (proxyStr) => {
   testingProxy.value = true
   proxyTestResult.value = '正在测试...'
@@ -937,10 +1087,22 @@ const handleExportProfile = async (id) => {
 }
 
 const handleImportProfile = async () => {
+  const scriptCountBefore = userScripts.value.length
   try {
     await ImportProfile()
     await fetchProfiles()
+    await fetchUserScripts()
     pushNotice('环境包已导入。', 'success', '导入成功')
+
+    // 随包脚本一律保持停用，需用户确认内容后再启用
+    const restored = userScripts.value.length - scriptCountBefore
+    if (restored > 0) {
+      pushNotice(
+        `环境包内含 ${restored} 个用户脚本，已导入但保持停用。请到「脚本」页确认内容后再启用。`,
+        'info',
+        '包含用户脚本'
+      )
+    }
   } catch (err) {
     if (err) pushNotice(formatErrorMessage(err, '导入环境包失败'), 'error', '导入失败')
   }
@@ -1016,6 +1178,7 @@ onMounted(async () => {
 
   fetchProfiles()
   fetchProxies()
+  fetchUserScripts()
   fetchAutomationState()
   
   // 检查是否有待启动的外部 URL
@@ -1083,6 +1246,7 @@ onUnmounted(() => {
       <nav class="nav-links">
         <div class="nav-item" :class="{ active: currentView === 'profiles' }" @click="currentView = 'profiles'"><Monitor :size="18" :stroke-width="2"/>环境</div>
         <div class="nav-item" :class="{ active: currentView === 'proxies' }" @click="currentView = 'proxies'"><ShieldCheck :size="18" :stroke-width="2"/>代理</div>
+        <div class="nav-item" :class="{ active: currentView === 'scripts' }" @click="currentView = 'scripts'"><FileCode :size="18" :stroke-width="2"/>脚本</div>
         <div class="nav-item" :class="{ active: currentView === 'logs' }" @click="currentView = 'logs'"><TerminalSquare :size="18" :stroke-width="2"/>日志</div>
         <div class="nav-item" :class="{ active: currentView === 'automation' }" @click="currentView = 'automation'"><Bot :size="18" :stroke-width="2"/>自动化</div>
         <div class="nav-item register-btn" @click="handleRegisterBrowser"><Link :size="16" :stroke-width="2"/>注册默认浏览器</div>
@@ -1156,6 +1320,10 @@ onUnmounted(() => {
                   <input v-model="newProxy.addr" placeholder="socks5://1.2.3.4:7891" />
                   <button @click="handleAddProxy" class="btn-create add">添加代理</button>
                </div>
+               <template v-else-if="currentView === 'scripts'">
+                 <button @click="handleImportScript" class="btn-ghost" style="margin-right: 8px;">导入脚本文件</button>
+                 <button @click="openScriptEditor(null)" class="btn-create">新建脚本</button>
+               </template>
                <button v-else-if="currentView === 'automation'" @click="fetchAutomationState" class="btn-ghost">刷新状态</button>
                <button v-else-if="currentView === 'logs'" @click="logs = []" class="btn-ghost">清空日志</button>
             </div>
@@ -1358,6 +1526,75 @@ onUnmounted(() => {
                 </tr>
                 <tr v-if="filteredProxies.length === 0">
                   <td colspan="5" class="empty-table">没有匹配到代理。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- 用户脚本视图 -->
+          <div v-else-if="currentView === 'scripts'" class="list-view">
+            <div class="script-intro glass">
+              <p>
+                脚本默认运行在<b>隔离沙箱</b>中，网页无法察觉其存在。
+                脚本对页面 DOM 的改动仍然是页面可见的，这是共享同一棵 DOM 树的固有限制。
+              </p>
+              <p class="script-intro-tip">
+                在此保存的脚本还需要到对应环境的「环境设置」里勾选启用，重启该环境后生效。
+              </p>
+            </div>
+
+            <table class="proxy-table glass">
+              <thead>
+                <tr>
+                  <th>名称</th>
+                  <th>匹配规则</th>
+                  <th>注入时机</th>
+                  <th>运行模式</th>
+                  <th>启用</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="s in filteredScripts" :key="s.id">
+                  <td>
+                    <div class="script-name">{{ s.name }}</div>
+                    <div v-if="s.description" class="script-desc">{{ s.description }}</div>
+                  </td>
+                  <td>
+                    <code v-for="m in (s.matches || [])" :key="m" class="script-match">{{ m }}</code>
+                    <span v-if="!s.matches || s.matches.length === 0" class="script-warn">
+                      <ShieldAlert :size="14" /> 无合法规则，启用也不会生效
+                    </span>
+                  </td>
+                  <td><code>{{ s.run_at }}</code></td>
+                  <td>
+                    <select
+                      :value="s.world || 'isolated'"
+                      @change="handleChangeScriptWorld(s, $event.target.value)"
+                      class="script-world-select"
+                    >
+                      <option value="isolated">隔离沙箱（不可检测）</option>
+                      <option value="page">主世界（会留痕迹）</option>
+                    </select>
+                  </td>
+                  <td>
+                    <button
+                      @click="handleToggleScript(s)"
+                      class="status-chip status-chip-button"
+                      :class="{ online: s.enabled }"
+                    >
+                      {{ s.enabled ? '已启用' : '未启用' }}
+                    </button>
+                  </td>
+                  <td>
+                    <button @click="openScriptEditor(s)" class="btn-icon">编辑</button>
+                    <button @click="handleDeleteScript(s)" class="btn-icon del">删除</button>
+                  </td>
+                </tr>
+                <tr v-if="filteredScripts.length === 0">
+                  <td colspan="6" class="empty-table">
+                    还没有脚本。点击右上角「新建脚本」或「导入脚本文件」开始。
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -1589,6 +1826,33 @@ onUnmounted(() => {
               <input v-model="editingProfile.start_url" placeholder="例如 google.com 或 https://chatgpt.com" />
               <span class="hint">普通启动时会优先打开这里；外部链接拉起和指纹验证仍会覆盖它。</span>
             </div>
+            <div class="field">
+              <label>本环境启用的用户脚本</label>
+              <div v-if="userScripts.length === 0" class="hint">
+                还没有可用脚本，先到左侧「脚本」页新建或导入。
+              </div>
+              <div v-else class="script-picker">
+                <label
+                  v-for="s in userScripts"
+                  :key="s.id"
+                  class="script-picker-item"
+                  :class="{ disabled: !s.enabled }"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="(editingProfile.enabled_scripts || []).includes(s.id)"
+                    @change="toggleScriptForEditingProfile(s.id)"
+                  />
+                  <span class="script-picker-name">{{ s.name }}</span>
+                  <span v-if="!s.enabled" class="script-picker-tag">全局未启用</span>
+                  <span v-else-if="s.world === 'page'" class="script-picker-tag warn">主世界</span>
+                </label>
+              </div>
+              <span class="hint">
+                仅「全局已启用」且在此勾选的脚本才会注入；未勾选任何脚本时本环境不会生成扩展，
+                暴露面与未使用该功能时完全一致。修改后需重启该环境生效。
+              </span>
+            </div>
           </div>
           <div class="modal-footer">
             <button @click="showSettingsModal = false" class="btn-ghost">取消</button>
@@ -1612,6 +1876,30 @@ onUnmounted(() => {
             <button @click="handleImportFromFile" class="btn-ghost" style="margin-right: auto;">导入 JSON 文件</button>
             <button @click="showCookieModal = false" class="btn-ghost">关闭</button>
             <button @click="saveCookies" class="btn-solid">保存数据</button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- Modal: 用户脚本编辑器 -->
+    <Transition name="fade">
+      <div v-if="showScriptModal" class="modal-backdrop" @click.self="showScriptModal = false">
+        <div class="modal glass wide">
+          <div class="modal-header">
+            <h3>{{ editingScript ? `编辑脚本 - ${editingScript.name}` : '新建脚本' }}</h3>
+          </div>
+          <div class="modal-content">
+            <span class="hint" style="margin-bottom: 8px; display: block;">
+              使用标准 UserScript 元数据块。<code>@match</code> 需为浏览器可识别的匹配模式
+              （如 <code>https://example.com/*</code>）；<code>@include</code> 的通配与正则写法会被忽略。
+            </span>
+            <textarea v-model="scriptSource" class="editor" spellcheck="false"></textarea>
+          </div>
+          <div class="modal-footer">
+            <button @click="showScriptModal = false" class="btn-ghost">取消</button>
+            <button @click="handleSaveScript" :disabled="savingScript" class="btn-solid">
+              {{ savingScript ? '保存中...' : '保存脚本' }}
+            </button>
           </div>
         </div>
       </div>
@@ -2128,6 +2416,23 @@ select option {
 .proxy-table td code { color: var(--primary); }
 .proxy-table tbody tr { transition: background var(--motion-base) ease, transform var(--motion-fast) var(--motion-emphasis); }
 .empty-table { text-align: center; color: var(--text-dim); padding: 28px 16px; }
+
+/* --- 用户脚本 --- */
+.script-intro { padding: 16px 18px; border-radius: var(--radius-md); margin-bottom: 16px; border: 1px solid var(--border); }
+.script-intro p { font-size: 0.8rem; color: var(--text-dim); line-height: 1.7; margin: 0; }
+.script-intro b { color: var(--primary-ink); }
+.script-intro-tip { margin-top: 6px !important; opacity: 0.8; }
+.script-name { font-weight: 600; }
+.script-desc { font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; }
+.script-match { display: inline-block; margin: 2px 6px 2px 0; font-size: 0.72rem; }
+.script-warn { display: inline-flex; align-items: center; gap: 4px; font-size: 0.72rem; color: #fbbf24; }
+.script-world-select { font-size: 0.75rem; padding: 4px 8px; border-radius: var(--radius-sm); }
+.script-picker { display: flex; flex-direction: column; gap: 6px; max-height: 168px; overflow-y: auto; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: rgba(255,255,255,0.02); }
+.script-picker-item { display: flex; align-items: center; gap: 8px; font-size: 0.8rem; cursor: pointer; }
+.script-picker-item.disabled { opacity: 0.55; }
+.script-picker-name { flex: 1; }
+.script-picker-tag { font-size: 0.68rem; color: var(--text-dim); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
+.script-picker-tag.warn { color: #fbbf24; border-color: rgba(251, 191, 36, 0.35); }
 
 .app-layout.tone-proxies .top-bar,
 .app-layout.tone-automation .top-bar,

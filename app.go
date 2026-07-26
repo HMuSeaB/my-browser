@@ -44,6 +44,22 @@ type BrowserProfile struct {
 	Platform string `json:"platform"`  // Windows/macOS/Linux
 	Cookies  string `json:"cookies"`   // JSON 格式的 Cookie 字符串
 	CreateAt int64  `json:"create_at"`
+	// EnabledScripts 为本环境启用的用户脚本 ID 列表。
+	// nil 表示未启用任何脚本，旧版 profiles.json 反序列化后即为该值，天然向后兼容。
+	EnabledScripts []string `json:"enabled_scripts"`
+}
+
+// UserScript 代表一个用户脚本（油猴脚本）
+type UserScript struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Matches     []string `json:"matches"`  // 解析自 @match / @include
+	RunAt       string   `json:"run_at"`   // document_start | document_end | document_idle
+	World       string   `json:"world"`    // isolated（默认，页面不可检测）| page（会留下可检测痕迹）
+	Grants      []string `json:"grants"`   // 解析自 @grant
+	Enabled     bool     `json:"enabled"`  // 全局开关
+	UpdatedAt   int64    `json:"updated_at"`
 }
 
 // ProxyEntry 代表代理池中的一个条目
@@ -106,6 +122,7 @@ type App struct {
 	ctx                  context.Context
 	profiles             []BrowserProfile
 	proxies              []ProxyEntry
+	userScripts          []UserScript
 	StartupURL           string // 用于从命令行拉起的 URL
 	listener             net.Listener
 	dataDir              string
@@ -146,15 +163,14 @@ type bidiCommandRequest struct {
 
 type bidiCommandResponse struct {
 	ID     int64           `json:"id,omitempty"`
+	Type   string          `json:"type,omitempty"`
 	Method string          `json:"method,omitempty"`
 	Params json.RawMessage `json:"params,omitempty"`
 	Result json.RawMessage `json:"result,omitempty"`
-	Error  *bidiError      `json:"error,omitempty"`
-}
-
-type bidiError struct {
-	Error   string `json:"error"`
-	Message string `json:"message"`
+	// WebDriver BiDi 的错误响应是扁平结构，error 为错误码字符串而非对象：
+	// {"type":"error","id":1,"error":"invalid session id","message":"...","stacktrace":"..."}
+	Error   string `json:"error,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 type bidiGetTreeResult struct {
@@ -196,6 +212,7 @@ func NewApp() *App {
 	}
 	a.loadProfiles()
 	a.loadProxies()
+	a.loadUserScripts()
 	return a
 }
 
@@ -516,6 +533,111 @@ func (a *App) saveProxies() error {
 	return os.WriteFile(path, data, 0644)
 }
 
+// --- 用户脚本（油猴脚本）管理 ---
+
+var (
+	metaBlockPattern = regexp.MustCompile(`(?s)//\s*==UserScript==\s*\r?\n(.*?)//\s*==/UserScript==`)
+	metaLinePattern  = regexp.MustCompile(`^//\s*@(\S+)\s+(.*)$`)
+	// matchPatternRe 校验 WebExtension 匹配模式。
+	// 必须严格校验：manifest 中只要有一条非法模式，Gecko 会拒绝加载整个扩展。
+	matchPatternRe = regexp.MustCompile(`^(\*|https?|wss?|ftp)://(\*|\*\.[^/*]+|[^/*]+)/`)
+)
+
+func (a *App) getUserScriptStoragePath() string {
+	return filepath.Join(a.getDataDir(), "userscripts.json")
+}
+
+func (a *App) getUserScriptSourceDir() string {
+	return filepath.Join(a.getDataDir(), "userscripts")
+}
+
+func (a *App) getUserScriptSourcePath(id string) string {
+	return filepath.Join(a.getUserScriptSourceDir(), id+".user.js")
+}
+
+func (a *App) loadUserScripts() {
+	data, err := os.ReadFile(a.getUserScriptStoragePath())
+	if err != nil {
+		a.userScripts = []UserScript{}
+		return
+	}
+	if err := json.Unmarshal(data, &a.userScripts); err != nil {
+		fmt.Printf("解析用户脚本索引失败，已重置: %v\n", err)
+		a.userScripts = []UserScript{}
+	}
+}
+
+func (a *App) saveUserScripts() error {
+	data, err := json.MarshalIndent(a.userScripts, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(a.getUserScriptStoragePath(), data, 0644)
+}
+
+// isValidMatchPattern 判断是否为 Gecko 可接受的匹配模式。
+func isValidMatchPattern(pattern string) bool {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "<all_urls>" {
+		return true
+	}
+	if strings.HasPrefix(pattern, "file:///") {
+		return true
+	}
+	return matchPatternRe.MatchString(pattern)
+}
+
+// parseUserScriptMeta 解析标准 UserScript 元数据块。
+// 解析失败不阻断保存：脚本仍可保存，由用户在界面上手工补齐匹配规则。
+func parseUserScriptMeta(source string) UserScript {
+	script := UserScript{RunAt: "document_end", World: "isolated"}
+
+	block := metaBlockPattern.FindStringSubmatch(source)
+	if len(block) < 2 {
+		return script
+	}
+
+	for _, line := range strings.Split(block[1], "\n") {
+		m := metaLinePattern.FindStringSubmatch(strings.TrimSpace(line))
+		if len(m) < 3 {
+			continue
+		}
+		key := strings.ToLower(m[1])
+		val := strings.TrimSpace(m[2])
+		if val == "" {
+			continue
+		}
+
+		switch key {
+		case "name":
+			script.Name = val
+		case "description":
+			script.Description = val
+		case "match", "include":
+			// @include 允许 * 与正则等非标准写法，这里只收 Gecko 能接受的，
+			// 其余丢弃以免污染 manifest 导致整个扩展加载失败。
+			if isValidMatchPattern(val) {
+				script.Matches = append(script.Matches, val)
+			}
+		case "run-at":
+			// 油猴写法 document-start 转为 WebExtension 的 document_start
+			normalized := strings.ReplaceAll(val, "-", "_")
+			switch normalized {
+			case "document_start", "document_end", "document_idle":
+				script.RunAt = normalized
+			}
+		case "grant":
+			// @grant none 在油猴中表示注入主世界，语义与直觉相反。
+			// 此处仅视作"不需要 GM API"，是否进入 page 模式由界面开关独立决定。
+			if !strings.EqualFold(val, "none") {
+				script.Grants = append(script.Grants, val)
+			}
+		}
+	}
+
+	return script
+}
+
 func defaultAutomationConfig() AutomationConfig {
 	return AutomationConfig{
 		Enabled:       true,
@@ -719,32 +841,29 @@ func sendBiDiCommand(conn *websocket.Conn, commandID int64, method string, param
 		return nil, err
 	}
 
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break
-		}
+	// 整体只设置一次读超时。gorilla 的连接在一次读超时后即进入失败态，
+	// 若按超时重试，下一次读取会直接 panic 而非返回错误。
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, err
+	}
 
-		if err := conn.SetReadDeadline(time.Now().Add(minDuration(time.Second, remaining))); err != nil {
-			return nil, err
-		}
-
+	for {
 		var response bidiCommandResponse
 		if err := conn.ReadJSON(&response); err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
+				return nil, fmt.Errorf("%s timed out after %s", method, timeout)
 			}
 			return nil, err
 		}
 
+		// 跳过事件推送与其他命令的响应；读超时已在整体层面兜底
 		if response.ID != commandID {
 			continue
 		}
-		if response.Error != nil {
-			message := strings.TrimSpace(response.Error.Message)
+		if response.Error != "" {
+			message := strings.TrimSpace(response.Message)
 			if message == "" {
-				message = strings.TrimSpace(response.Error.Error)
+				message = strings.TrimSpace(response.Error)
 			}
 			if message == "" {
 				message = "unknown bidi error"
@@ -753,8 +872,6 @@ func sendBiDiCommand(conn *websocket.Conn, commandID int64, method string, param
 		}
 		return response.Result, nil
 	}
-
-	return nil, fmt.Errorf("%s timed out after %s", method, timeout)
 }
 
 func extractRootContextID(raw json.RawMessage) (string, error) {
@@ -966,6 +1083,201 @@ func (a *App) UpdateProxy(updated ProxyEntry) error {
 		}
 	}
 	return fmt.Errorf("未找到代理")
+}
+
+// --- 用户脚本对外接口 ---
+
+// GetUserScripts 返回全部用户脚本的元数据（不含正文）
+func (a *App) GetUserScripts() []UserScript {
+	if a.userScripts == nil {
+		return []UserScript{}
+	}
+	return a.userScripts
+}
+
+// GetUserScriptSource 读取脚本正文
+func (a *App) GetUserScriptSource(id string) (string, error) {
+	data, err := os.ReadFile(a.getUserScriptSourcePath(id))
+	if err != nil {
+		return "", fmt.Errorf("读取脚本内容失败: %v", err)
+	}
+	return string(data), nil
+}
+
+// SaveUserScript 保存脚本。id 为空表示新建。
+// 元数据由正文解析得出，用户在界面上的手工调整通过 UpdateUserScriptMeta 覆盖。
+func (a *App) SaveUserScript(id, source string) (UserScript, error) {
+	if strings.TrimSpace(source) == "" {
+		return UserScript{}, fmt.Errorf("脚本内容不能为空")
+	}
+
+	if err := os.MkdirAll(a.getUserScriptSourceDir(), 0755); err != nil {
+		return UserScript{}, fmt.Errorf("创建脚本目录失败: %v", err)
+	}
+
+	parsed := parseUserScriptMeta(source)
+
+	var target *UserScript
+	for i := range a.userScripts {
+		if a.userScripts[i].ID == id {
+			target = &a.userScripts[i]
+			break
+		}
+	}
+
+	if target == nil {
+		// 新建：默认不启用，避免脚本一保存就立刻在所有环境生效
+		script := UserScript{
+			ID:      uuid.New().String(),
+			Enabled: false,
+		}
+		a.userScripts = append(a.userScripts, script)
+		target = &a.userScripts[len(a.userScripts)-1]
+	}
+
+	target.Name = parsed.Name
+	if strings.TrimSpace(target.Name) == "" {
+		target.Name = "未命名脚本"
+	}
+	target.Description = parsed.Description
+	target.Matches = parsed.Matches
+	target.RunAt = parsed.RunAt
+	target.Grants = parsed.Grants
+	// World 由界面开关控制，重新解析正文时不应把用户的选择覆盖掉
+	if target.World == "" {
+		target.World = parsed.World
+	}
+	target.UpdatedAt = time.Now().Unix()
+
+	if err := os.WriteFile(a.getUserScriptSourcePath(target.ID), []byte(source), 0644); err != nil {
+		return UserScript{}, fmt.Errorf("写入脚本文件失败: %v", err)
+	}
+
+	result := *target
+	if err := a.saveUserScripts(); err != nil {
+		return result, err
+	}
+
+	a.Log("info", fmt.Sprintf("已保存用户脚本: %s", result.Name))
+	if len(result.Matches) == 0 {
+		a.Log("warn", fmt.Sprintf("脚本 [%s] 未解析到合法的 @match 规则，启用后不会生效", result.Name))
+	}
+	return result, nil
+}
+
+// SetUserScriptWorld 设置脚本的运行世界。
+// page 模式会在页面 window 上留下可被检测的痕迹，仅在脚本需访问页面 JS 变量时使用。
+func (a *App) SetUserScriptWorld(id, world string) error {
+	if world != "isolated" && world != "page" {
+		return fmt.Errorf("无效的运行模式: %s", world)
+	}
+	for i := range a.userScripts {
+		if a.userScripts[i].ID == id {
+			a.userScripts[i].World = world
+			a.userScripts[i].UpdatedAt = time.Now().Unix()
+			return a.saveUserScripts()
+		}
+	}
+	return fmt.Errorf("未找到脚本")
+}
+
+// SetUserScriptEnabled 设置脚本的全局启用状态
+func (a *App) SetUserScriptEnabled(id string, enabled bool) error {
+	for i := range a.userScripts {
+		if a.userScripts[i].ID == id {
+			a.userScripts[i].Enabled = enabled
+			a.userScripts[i].UpdatedAt = time.Now().Unix()
+			return a.saveUserScripts()
+		}
+	}
+	return fmt.Errorf("未找到脚本")
+}
+
+// DeleteUserScript 删除脚本，并清理所有环境中对它的引用
+func (a *App) DeleteUserScript(id string) error {
+	found := false
+	for i, s := range a.userScripts {
+		if s.ID == id {
+			a.userScripts = append(a.userScripts[:i], a.userScripts[i+1:]...)
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("未找到脚本")
+	}
+
+	if err := os.Remove(a.getUserScriptSourcePath(id)); err != nil && !os.IsNotExist(err) {
+		a.Log("warn", fmt.Sprintf("删除脚本文件失败: %v", err))
+	}
+
+	// 清理各环境的引用，避免留下悬空 ID
+	profilesDirty := false
+	for i := range a.profiles {
+		filtered := make([]string, 0, len(a.profiles[i].EnabledScripts))
+		for _, sid := range a.profiles[i].EnabledScripts {
+			if sid != id {
+				filtered = append(filtered, sid)
+			}
+		}
+		if len(filtered) != len(a.profiles[i].EnabledScripts) {
+			a.profiles[i].EnabledScripts = filtered
+			profilesDirty = true
+		}
+	}
+	if profilesDirty {
+		if err := a.saveProfiles(); err != nil {
+			return err
+		}
+	}
+
+	a.Log("info", fmt.Sprintf("已删除用户脚本: %s", id))
+	return a.saveUserScripts()
+}
+
+// SetProfileScripts 设置某个环境启用的脚本清单
+func (a *App) SetProfileScripts(profileID string, scriptIDs []string) error {
+	known := make(map[string]bool, len(a.userScripts))
+	for _, s := range a.userScripts {
+		known[s.ID] = true
+	}
+
+	filtered := make([]string, 0, len(scriptIDs))
+	for _, id := range scriptIDs {
+		if known[id] {
+			filtered = append(filtered, id)
+		}
+	}
+
+	for i := range a.profiles {
+		if a.profiles[i].ID == profileID {
+			a.profiles[i].EnabledScripts = filtered
+			a.Log("info", fmt.Sprintf("环境 [%s] 已启用 %d 个脚本，重启环境后生效",
+				a.profiles[i].Name, len(filtered)))
+			return a.saveProfiles()
+		}
+	}
+	return fmt.Errorf("未找到环境")
+}
+
+// ImportUserScriptFromFile 从本地 .user.js 文件导入脚本
+func (a *App) ImportUserScriptFromFile() (UserScript, error) {
+	path, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "选择用户脚本文件",
+		Filters: []runtime.FileFilter{
+			{DisplayName: "UserScript (*.user.js;*.js)", Pattern: "*.user.js;*.js"},
+		},
+	})
+	if err != nil || path == "" {
+		return UserScript{}, err
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return UserScript{}, fmt.Errorf("读取脚本文件失败: %v", err)
+	}
+
+	return a.SaveUserScript("", string(data))
 }
 
 func (a *App) TestProxyEntry(id string) (string, error) {
@@ -1493,6 +1805,11 @@ func (a *App) setupStealthPrefs(userDataDir, proxyStr string) error {
 		"media.navigator.enabled":           "true",
 		"privacy.resistFingerprinting":      "false", // 避免干扰自定义指纹
 		"devtools.debugger.remote-enabled":  "false",
+
+		// 用户脚本引擎所需。均为 about:config 层面配置，页面 JS 无法读取，不构成指纹泄漏。
+		"extensions.autoDisableScopes":  "0",     // 关键：否则 profile 内的扩展会被静默禁用
+		"extensions.enabledScopes":      "5",     // SCOPE_PROFILE|SCOPE_APPLICATION，与 camoufox.cfg 一致
+		"xpinstall.signatures.required": "false", // 允许自建的未签名引擎（Camoufox 默认已关闭强制签名）
 	}
 
 	// 解析代理配置
@@ -1739,6 +2056,143 @@ func (a *App) setupCookies(userDataDir, cookieJSON string) error {
 	return nil
 }
 
+// userScriptExtID 是脚本引擎扩展的固定 ID。
+// 页面无法据此探测扩展：Gecko 为每个 profile 分配随机 moz-extension UUID，
+// 实测按 ID 请求扩展资源一律被拦截。
+const userScriptExtID = "userscript-engine@mybrowser.local"
+
+// resolveEnabledScripts 返回本环境实际生效的脚本：全局启用 ∩ 环境启用 ∩ 具备合法匹配规则。
+func (a *App) resolveEnabledScripts(profile BrowserProfile) []UserScript {
+	if len(profile.EnabledScripts) == 0 {
+		return nil
+	}
+
+	wanted := make(map[string]bool, len(profile.EnabledScripts))
+	for _, id := range profile.EnabledScripts {
+		wanted[id] = true
+	}
+
+	result := make([]UserScript, 0, len(profile.EnabledScripts))
+	for _, s := range a.userScripts {
+		if !s.Enabled || !wanted[s.ID] {
+			continue
+		}
+		// 无匹配规则的脚本一律跳过，避免意外全站注入扩大暴露面
+		if len(s.Matches) == 0 {
+			a.Log("warn", fmt.Sprintf("脚本 [%s] 无匹配规则，已跳过", s.Name))
+			continue
+		}
+		result = append(result, s)
+	}
+	return result
+}
+
+// setupUserScripts 按环境启用清单生成用户脚本引擎扩展。
+//
+// 未启用任何脚本时不落地任何文件，使浏览器暴露面与未引入本功能时完全一致。
+// 每次启动前重建扩展目录，保证脚本改动立即生效且禁用后不留残迹。
+func (a *App) setupUserScripts(userDataDir string, profile BrowserProfile) error {
+	extDir := filepath.Join(userDataDir, "extensions", userScriptExtID)
+
+	if err := os.RemoveAll(extDir); err != nil {
+		return fmt.Errorf("清理旧脚本扩展失败: %w", err)
+	}
+
+	scripts := a.resolveEnabledScripts(profile)
+	if len(scripts) == 0 {
+		return nil
+	}
+
+	if err := os.MkdirAll(extDir, 0755); err != nil {
+		return fmt.Errorf("创建脚本扩展目录失败: %w", err)
+	}
+
+	contentScripts := make([]map[string]interface{}, 0, len(scripts))
+	for _, s := range scripts {
+		source, err := os.ReadFile(a.getUserScriptSourcePath(s.ID))
+		if err != nil {
+			a.Log("warn", fmt.Sprintf("脚本 [%s] 源文件读取失败，已跳过: %v", s.Name, err))
+			continue
+		}
+
+		// 二次校验：索引可能被手工编辑过，非法模式会导致整个扩展被拒绝加载
+		validMatches := make([]string, 0, len(s.Matches))
+		for _, m := range s.Matches {
+			if isValidMatchPattern(m) {
+				validMatches = append(validMatches, m)
+			} else {
+				a.Log("warn", fmt.Sprintf("脚本 [%s] 的匹配规则 %q 非法，已忽略", s.Name, m))
+			}
+		}
+		if len(validMatches) == 0 {
+			continue
+		}
+
+		payload := string(source)
+		if s.World == "page" {
+			payload = wrapForPageWorld(payload)
+		}
+
+		fileName := "us_" + s.ID + ".js"
+		if err := os.WriteFile(filepath.Join(extDir, fileName), []byte(payload), 0644); err != nil {
+			return fmt.Errorf("写入脚本 [%s] 失败: %w", s.Name, err)
+		}
+
+		contentScripts = append(contentScripts, map[string]interface{}{
+			"matches":    validMatches,
+			"js":         []string{fileName},
+			"run_at":     s.RunAt,
+			"all_frames": false,
+		})
+	}
+
+	// 全部脚本都不可用时回退到零暴露面，而不是留下一个空壳扩展
+	if len(contentScripts) == 0 {
+		return os.RemoveAll(extDir)
+	}
+
+	manifest := map[string]interface{}{
+		"manifest_version": 2,
+		"name":             "Engine",
+		"version":          "1.0",
+		"browser_specific_settings": map[string]interface{}{
+			"gecko": map[string]string{"id": userScriptExtID},
+		},
+		"content_scripts": contentScripts,
+		// 刻意不声明 web_accessible_resources：该字段是扩展被页面枚举的主要途径，
+		// 按最小暴露面原则省略。
+	}
+
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(extDir, "manifest.json"), data, 0644); err != nil {
+		return err
+	}
+
+	a.Log("info", fmt.Sprintf("已为环境 [%s] 注入 %d 个用户脚本", profile.Name, len(contentScripts)))
+	return nil
+}
+
+// wrapForPageWorld 将脚本注入页面主世界，使其可访问页面自身的 JS 变量。
+//
+// 该模式会在 window 上留下可被页面枚举的痕迹（实测泄漏 3 项探针），
+// 仅在脚本确实需要读写页面 JS 变量时使用。
+func wrapForPageWorld(source string) string {
+	// 借 JSON 编码将源码安全转义为 JS 字符串字面量，避免引号与换行破坏语法
+	payload, err := json.Marshal(source)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf(`(function(){try{
+var s=document.createElement('script');
+s.textContent=%s;
+(document.head||document.documentElement).appendChild(s);
+s.remove();
+}catch(e){}})();`, payload)
+}
+
 // SyncCookies 从浏览器的物理数据库中提取 Cookie 并同步到配置文件
 func (a *App) SyncCookies(profileID string) error {
 	var profile *BrowserProfile
@@ -1965,6 +2419,11 @@ func (a *App) exportProfileBundle(profile BrowserProfile, targetPath string) err
 		return err
 	}
 
+	// 脚本正文存放在 profile 目录之外，需单独打包，否则导入端只会得到一份空的启用清单
+	if err := a.writeUserScriptsToBundle(zipWriter, profile); err != nil {
+		return err
+	}
+
 	userDataDir := filepath.Join(a.getDataDir(), "profiles", profile.ID)
 	if _, err := os.Stat(userDataDir); os.IsNotExist(err) {
 		return nil
@@ -1977,6 +2436,10 @@ func (a *App) exportProfileBundle(profile BrowserProfile, targetPath string) err
 			return walkErr
 		}
 		if info.IsDir() {
+			// extensions/ 每次启动都按启用清单重建，打包进去只会带来体积膨胀与陈旧内容
+			if info.Name() == "extensions" && filepath.Dir(path) == userDataDir {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
@@ -1999,6 +2462,170 @@ func (a *App) exportProfileBundle(profile BrowserProfile, targetPath string) err
 		_, err = io.Copy(archiveFile, srcFile)
 		return err
 	})
+}
+
+// writeUserScriptsToBundle 把本环境引用到的用户脚本写入环境包。
+//
+// 打包的是"被引用"而非"实际生效"的脚本：全局停用的脚本同样随包带走，
+// 否则在目标机器上重新启用后会发现脚本不存在。
+func (a *App) writeUserScriptsToBundle(zipWriter *zip.Writer, profile BrowserProfile) error {
+	if len(profile.EnabledScripts) == 0 {
+		return nil
+	}
+
+	wanted := make(map[string]bool, len(profile.EnabledScripts))
+	for _, id := range profile.EnabledScripts {
+		wanted[id] = true
+	}
+
+	bundled := make([]UserScript, 0, len(profile.EnabledScripts))
+	for _, s := range a.userScripts {
+		if !wanted[s.ID] {
+			continue
+		}
+
+		source, err := os.ReadFile(a.getUserScriptSourcePath(s.ID))
+		if err != nil {
+			a.Log("warn", fmt.Sprintf("脚本 [%s] 源文件缺失，未随环境包导出: %v", s.Name, err))
+			continue
+		}
+
+		writer, err := zipWriter.Create("scripts/" + s.ID + ".user.js")
+		if err != nil {
+			return err
+		}
+		if _, err := writer.Write(source); err != nil {
+			return err
+		}
+		bundled = append(bundled, s)
+	}
+
+	if len(bundled) == 0 {
+		return nil
+	}
+
+	index, err := json.MarshalIndent(bundled, "", "  ")
+	if err != nil {
+		return err
+	}
+	writer, err := zipWriter.Create("scripts/index.json")
+	if err != nil {
+		return err
+	}
+	_, err = writer.Write(index)
+	return err
+}
+
+// restoreBundledUserScripts 还原环境包内的用户脚本，返回旧 ID 到新 ID 的映射。
+//
+// 导入的脚本一律保持全局停用：环境包可能来自他人，其中的脚本会在匹配站点上
+// 执行任意代码，需由用户确认内容后再显式启用。
+func (a *App) restoreBundledUserScripts(zipReader *zip.Reader) (map[string]string, error) {
+	var index []UserScript
+	sources := make(map[string][]byte)
+
+	for _, file := range zipReader.File {
+		if file.FileInfo().IsDir() || !strings.HasPrefix(file.Name, "scripts/") {
+			continue
+		}
+
+		reader, err := file.Open()
+		if err != nil {
+			return nil, err
+		}
+		content, err := io.ReadAll(reader)
+		reader.Close()
+		if err != nil {
+			return nil, err
+		}
+
+		if file.Name == "scripts/index.json" {
+			if err := json.Unmarshal(content, &index); err != nil {
+				return nil, fmt.Errorf("环境包脚本索引损坏: %w", err)
+			}
+			continue
+		}
+		if strings.HasSuffix(file.Name, ".user.js") {
+			id := strings.TrimSuffix(strings.TrimPrefix(file.Name, "scripts/"), ".user.js")
+			sources[id] = content
+		}
+	}
+
+	if len(index) == 0 {
+		return nil, nil
+	}
+
+	if err := os.MkdirAll(a.getUserScriptSourceDir(), 0755); err != nil {
+		return nil, fmt.Errorf("创建脚本目录失败: %w", err)
+	}
+
+	// 按正文建索引，重复导入同一个环境包时复用已有脚本而不是产生副本
+	existingByContent := make(map[string]string, len(a.userScripts))
+	for _, s := range a.userScripts {
+		if data, err := os.ReadFile(a.getUserScriptSourcePath(s.ID)); err == nil {
+			existingByContent[string(data)] = s.ID
+		}
+	}
+
+	idMap := make(map[string]string, len(index))
+	imported := 0
+
+	for _, s := range index {
+		source, ok := sources[s.ID]
+		if !ok {
+			a.Log("warn", fmt.Sprintf("环境包内脚本 [%s] 缺少正文，已跳过", s.Name))
+			continue
+		}
+
+		if existingID, duplicated := existingByContent[string(source)]; duplicated {
+			idMap[s.ID] = existingID
+			continue
+		}
+
+		newID := uuid.New().String()
+		if err := os.WriteFile(a.getUserScriptSourcePath(newID), source, 0644); err != nil {
+			return nil, fmt.Errorf("还原脚本 [%s] 失败: %w", s.Name, err)
+		}
+
+		restored := s
+		restored.ID = newID
+		restored.Enabled = false
+		restored.UpdatedAt = time.Now().Unix()
+
+		a.userScripts = append(a.userScripts, restored)
+		existingByContent[string(source)] = newID
+		idMap[s.ID] = newID
+		imported++
+	}
+
+	if imported > 0 {
+		if err := a.saveUserScripts(); err != nil {
+			return nil, err
+		}
+		a.Log("info", fmt.Sprintf(
+			"环境包内含 %d 个用户脚本，已导入并保持停用，请确认内容后再在脚本页启用", imported))
+	}
+
+	return idMap, nil
+}
+
+// remapImportedScriptIDs 将环境包内的旧脚本 ID 映射为本机的新 ID。
+// 未能还原的脚本会被丢弃，避免在启用清单里留下悬空引用。
+func remapImportedScriptIDs(ids []string, idMap map[string]string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	result := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if newID, ok := idMap[id]; ok {
+			result = append(result, newID)
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 func (a *App) importProfileBundle(sourcePath string) (BrowserProfile, error) {
@@ -2048,6 +2675,13 @@ func (a *App) importProfileBundle(sourcePath string) (BrowserProfile, error) {
 	profile.ID = uuid.New().String()
 	profile.Name = a.ensureUniqueProfileName(profile.Name)
 	profile.CreateAt = time.Now().Unix()
+
+	// 还原随包携带的用户脚本，并把启用清单里的旧 ID 换成本机新 ID
+	scriptIDMap, err := a.restoreBundledUserScripts(&zipReader.Reader)
+	if err != nil {
+		return BrowserProfile{}, err
+	}
+	profile.EnabledScripts = remapImportedScriptIDs(profile.EnabledScripts, scriptIDMap)
 
 	newUserDataDir := filepath.Join(a.getDataDir(), "profiles", profile.ID)
 	if err := os.MkdirAll(newUserDataDir, 0755); err != nil {
@@ -2125,6 +2759,11 @@ func (a *App) prepareProfileLaunch(profile BrowserProfile) (string, string, erro
 
 	if err := a.setupCookies(userDataDir, profile.Cookies); err != nil {
 		fmt.Printf("注入 Cookie 失败: %v\n", err)
+	}
+
+	// 按本环境启用清单生成用户脚本扩展；未启用脚本时不产生任何文件
+	if err := a.setupUserScripts(userDataDir, profile); err != nil {
+		a.Log("warn", fmt.Sprintf("用户脚本注入失败: %v", err))
 	}
 
 	return exePath, userDataDir, nil

@@ -67,3 +67,19 @@ export function UnregisterAsDefaultBrowser():Promise<string>;
 export function UpdateProfile(arg1:main.BrowserProfile):Promise<void>;
 
 export function UpdateProxy(arg1:main.ProxyEntry):Promise<void>;
+
+export function DeleteUserScript(arg1:string):Promise<void>;
+
+export function GetUserScriptSource(arg1:string):Promise<string>;
+
+export function GetUserScripts():Promise<Array<main.UserScript>>;
+
+export function ImportUserScriptFromFile():Promise<main.UserScript>;
+
+export function SaveUserScript(arg1:string,arg2:string):Promise<main.UserScript>;
+
+export function SetProfileScripts(arg1:string,arg2:Array<string>):Promise<void>;
+
+export function SetUserScriptEnabled(arg1:string,arg2:boolean):Promise<void>;
+
+export function SetUserScriptWorld(arg1:string,arg2:string):Promise<void>;

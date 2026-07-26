@@ -66,11 +66,12 @@ export namespace main {
 	    platform: string;
 	    cookies: string;
 	    create_at: number;
-	
+	    enabled_scripts: string[];
+
 	    static createFrom(source: any = {}) {
 	        return new BrowserProfile(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -82,6 +83,35 @@ export namespace main {
 	        this.platform = source["platform"];
 	        this.cookies = source["cookies"];
 	        this.create_at = source["create_at"];
+	        this.enabled_scripts = source["enabled_scripts"];
+	    }
+	}
+	export class UserScript {
+	    id: string;
+	    name: string;
+	    description: string;
+	    matches: string[];
+	    run_at: string;
+	    world: string;
+	    grants: string[];
+	    enabled: boolean;
+	    updated_at: number;
+
+	    static createFrom(source: any = {}) {
+	        return new UserScript(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.description = source["description"];
+	        this.matches = source["matches"];
+	        this.run_at = source["run_at"];
+	        this.world = source["world"];
+	        this.grants = source["grants"];
+	        this.enabled = source["enabled"];
+	        this.updated_at = source["updated_at"];
 	    }
 	}
 	export class ProxyEntry {

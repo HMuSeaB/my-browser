@@ -598,6 +598,129 @@ func TestSendBiDiCommandTimesOut(t *testing.T) {
 	}
 }
 
+// 回归：响应耗时超过 1 秒不得 panic。
+// 旧实现每轮重设 1 秒读超时并在超时后重试，而 gorilla 的连接一次读超时后即进入
+// 失败态，再次读取会 panic（repeated read on failed websocket connection）。
+func TestSendBiDiCommandSurvivesSlowResponse(t *testing.T) {
+	server, wsURL := newBiDiTestServer(t, func(conn *websocket.Conn) {
+		defer conn.Close()
+		var command bidiCommandRequest
+		if err := conn.ReadJSON(&command); err != nil {
+			return
+		}
+		time.Sleep(1500 * time.Millisecond) // 超过旧实现的 1 秒单轮超时
+		_ = conn.WriteJSON(map[string]interface{}{
+			"type":   "success",
+			"id":     command.ID,
+			"result": map[string]interface{}{"ok": true},
+		})
+	})
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	raw, err := sendBiDiCommand(conn, 7, "slow.command", nil, 10*time.Second)
+	if err != nil {
+		t.Fatalf("慢响应不应报错: %v", err)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("解析结果失败: %v", err)
+	}
+	if payload["ok"] != true {
+		t.Fatalf("结果内容异常: %+v", payload)
+	}
+}
+
+// 回归：BiDi 错误响应为扁平结构，error 字段是字符串。
+// 旧实现将其声明为对象，导致任何错误响应都退化成反序列化错误，真正的原因被吞掉。
+func TestSendBiDiCommandParsesFlatErrorResponse(t *testing.T) {
+	server, wsURL := newBiDiTestServer(t, func(conn *websocket.Conn) {
+		defer conn.Close()
+		var command bidiCommandRequest
+		if err := conn.ReadJSON(&command); err != nil {
+			return
+		}
+		_ = conn.WriteJSON(map[string]interface{}{
+			"type":       "error",
+			"id":         command.ID,
+			"error":      "invalid session id",
+			"message":    "会话尚未创建",
+			"stacktrace": "...",
+		})
+	})
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	_, err = sendBiDiCommand(conn, 3, "browsingContext.getTree", nil, 5*time.Second)
+	if err == nil {
+		t.Fatal("期望返回错误")
+	}
+	if !strings.Contains(err.Error(), "会话尚未创建") {
+		t.Fatalf("错误信息未被正确解析，实际: %v", err)
+	}
+	if strings.Contains(err.Error(), "cannot unmarshal") {
+		t.Fatalf("错误响应被误当作对象解析: %v", err)
+	}
+}
+
+// 事件推送与其他命令的响应应被跳过，不得干扰目标命令的结果
+func TestSendBiDiCommandSkipsUnrelatedMessages(t *testing.T) {
+	server, wsURL := newBiDiTestServer(t, func(conn *websocket.Conn) {
+		defer conn.Close()
+		var command bidiCommandRequest
+		if err := conn.ReadJSON(&command); err != nil {
+			return
+		}
+		// 先推一条事件，再推一条其他命令的响应，最后才是目标响应
+		_ = conn.WriteJSON(map[string]interface{}{
+			"type":   "event",
+			"method": "log.entryAdded",
+			"params": map[string]interface{}{"level": "info"},
+		})
+		_ = conn.WriteJSON(map[string]interface{}{
+			"type":   "success",
+			"id":     command.ID + 100,
+			"result": map[string]interface{}{"stale": true},
+		})
+		_ = conn.WriteJSON(map[string]interface{}{
+			"type":   "success",
+			"id":     command.ID,
+			"result": map[string]interface{}{"target": true},
+		})
+	})
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	raw, err := sendBiDiCommand(conn, 5, "test.command", nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("不应报错: %v", err)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("解析结果失败: %v", err)
+	}
+	if payload["target"] != true {
+		t.Fatalf("取到了错误的响应: %+v", payload)
+	}
+}
+
 func TestStartAutomationSessionReusesExistingSessionAndNavigatesRequestedURL(t *testing.T) {
 	navigateCalls := make(chan map[string]interface{}, 1)
 	server, wsURL := newBiDiTestServer(t, func(conn *websocket.Conn) {
@@ -611,12 +734,12 @@ func TestStartAutomationSessionReusesExistingSessionAndNavigatesRequestedURL(t *
 
 			switch command.Method {
 			case "session.new":
+				// WebDriver BiDi 的错误响应为扁平结构，error 是错误码字符串
 				_ = conn.WriteJSON(map[string]interface{}{
-					"id": command.ID,
-					"error": map[string]interface{}{
-						"error":   "session already active",
-						"message": "session already active",
-					},
+					"type":    "error",
+					"id":      command.ID,
+					"error":   "session already active",
+					"message": "session already active",
 				})
 			case "browsingContext.getTree":
 				_ = conn.WriteJSON(map[string]interface{}{
