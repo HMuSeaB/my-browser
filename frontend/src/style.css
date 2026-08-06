@@ -5,7 +5,7 @@
 }
 
 body {
-  font-family: 'Inter', -apple-system, system-ui, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   overflow: hidden;
 }
 
@@ -15,12 +15,12 @@ body {
   flex-direction: column;
 }
 
-/* 移除导致颜色冲突的硬编码变量，使用 App.vue 中定义的全局变体 */
+/* 极简精致面板样式 */
 .glass {
   background: var(--panel-surface, rgba(255, 255, 255, 0.05));
-  backdrop-filter: blur(var(--blur-strength, 20px));
-  -webkit-backdrop-filter: blur(var(--blur-strength, 20px));
-  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
-  border-radius: var(--radius-lg, 18px);
+  backdrop-filter: blur(var(--blur-strength, 8px));
+  -webkit-backdrop-filter: blur(var(--blur-strength, 8px));
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-lg, 10px);
 }
 

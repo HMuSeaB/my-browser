@@ -2392,7 +2392,7 @@ onUnmounted(() => {
 *::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 
 html { background: var(--bg); }
-body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--text); overflow: hidden; transition: background 0.35s ease, color 0.35s ease; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); overflow: hidden; transition: background 0.35s ease, color 0.35s ease; }
 button {
   font: inherit;
   border: none;
@@ -2415,28 +2415,7 @@ button:active { transform: var(--lift-press); }
 button:disabled { cursor: not-allowed; opacity: 0.6; transform: none; }
 
 .app-layout { display: flex; height: 100vh; position: relative; background: var(--bg); }
-.glass-bg { position: absolute; inset: 0; background: radial-gradient(circle at 65% 22%, rgba(var(--primary-rgb), 0.18) 0%, transparent 45%), radial-gradient(circle at 18% 78%, rgba(var(--primary-rgb), 0.12) 0%, transparent 40%); pointer-events: none; overflow: hidden; }
-.glass-bg::before,
-.glass-bg::after {
-  content: '';
-  position: absolute;
-  width: 34vw;
-  height: 34vw;
-  border-radius: 999px;
-  background: radial-gradient(circle, rgba(var(--primary-rgb), 0.18) 0%, transparent 62%);
-  filter: blur(60px);
-  animation: ambientFloat 20s ease-in-out infinite alternate;
-}
-.glass-bg::before {
-  top: -12vw;
-  right: 8vw;
-}
-.glass-bg::after {
-  left: -10vw;
-  bottom: -14vw;
-  opacity: 0.7;
-  animation-duration: 28s;
-}
+.glass-bg { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
 .glass-bg > * { pointer-events: none; }
 .app-layout::after {
   content: '';
@@ -2445,40 +2424,10 @@ button:disabled { cursor: not-allowed; opacity: 0.6; transform: none; }
   pointer-events: none;
   opacity: var(--texture-opacity);
   background-image:
-    linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
+    linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
   background-size: var(--texture-size) var(--texture-size);
-  mask-image: radial-gradient(circle at center, black 42%, transparent 100%);
-}
-
-.app-layout.tone-profiles .glass-bg {
-  background:
-    radial-gradient(circle at 78% 18%, rgba(var(--primary-rgb), 0.11) 0%, transparent 34%),
-    radial-gradient(circle at 18% 78%, rgba(var(--primary-rgb), 0.07) 0%, transparent 30%);
-}
-
-.app-layout.tone-profile-detail .glass-bg {
-  background:
-    radial-gradient(circle at 74% 14%, rgba(var(--primary-rgb), 0.14) 0%, transparent 32%),
-    radial-gradient(circle at 18% 84%, rgba(var(--primary-rgb), 0.05) 0%, transparent 24%);
-}
-
-.app-layout.tone-proxies .glass-bg {
-  background:
-    linear-gradient(180deg, rgba(var(--primary-rgb), 0.04), transparent 24%),
-    radial-gradient(circle at 86% 12%, rgba(var(--primary-rgb), 0.08) 0%, transparent 28%);
-}
-
-.app-layout.tone-automation .glass-bg {
-  background:
-    radial-gradient(circle at 76% 16%, rgba(var(--primary-rgb), 0.15) 0%, transparent 26%),
-    linear-gradient(180deg, rgba(var(--primary-rgb), 0.04), transparent 22%);
-}
-
-.app-layout.tone-logs .glass-bg {
-  background:
-    linear-gradient(180deg, rgba(255,255,255,0.018), transparent 18%),
-    radial-gradient(circle at 84% 14%, rgba(var(--primary-rgb), 0.08) 0%, transparent 22%);
+  mask-image: radial-gradient(circle at center, black 60%, transparent 100%);
 }
 
 .notice-stack {
@@ -2657,9 +2606,7 @@ button:disabled { cursor: not-allowed; opacity: 0.6; transform: none; }
 
 .app-layout.tone-profiles .top-bar,
 .app-layout.tone-profile-detail .top-bar {
-  background:
-    linear-gradient(180deg, rgba(255,255,255,0.055), rgba(255,255,255,0.024)),
-    radial-gradient(circle at right top, rgba(var(--primary-rgb), 0.08), transparent 42%);
+  background: var(--panel-surface);
 }
 
 .app-layout.tone-profiles .profile-tile,
@@ -2670,17 +2617,6 @@ button:disabled { cursor: not-allowed; opacity: 0.6; transform: none; }
 .app-layout.tone-profiles .profile-meta-grid,
 .app-layout.tone-profile-detail .detail-overview-grid {
   position: relative;
-}
-
-.app-layout.tone-profiles .profile-meta-grid::before,
-.app-layout.tone-profile-detail .detail-overview-grid::before {
-  content: '';
-  position: absolute;
-  inset: -10px;
-  border-radius: calc(var(--radius-lg) + 4px);
-  background: linear-gradient(135deg, rgba(var(--primary-rgb), 0.05), transparent 55%);
-  pointer-events: none;
-  opacity: 0.7;
 }
 
 .profile-detail-page { padding: 24px; border-radius: var(--radius-xl); border: 1px solid var(--border); display: flex; flex-direction: column; gap: 20px; background: var(--panel-surface); box-shadow: var(--shadow-strong); }
@@ -2702,7 +2638,7 @@ button:disabled { cursor: not-allowed; opacity: 0.6; transform: none; }
 .detail-session-panel { display: flex; flex-direction: column; gap: 12px; padding: 16px; border-radius: var(--radius-lg); background: rgba(var(--primary-rgb), 0.06); border: 1px solid rgba(var(--primary-rgb), 0.14); box-shadow: inset 0 1px 0 rgba(255,255,255,0.03); }
 
 /* Modal */
-.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(8px); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 100; }
 .modal { width: 480px; padding: 32px; border-radius: var(--radius-xl); border: none; display: flex; flex-direction: column; gap: 24px; box-shadow: var(--shadow-strong); background: var(--bg-panel); }
 .modal.wide { width: 800px; }
 
