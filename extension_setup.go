@@ -12,16 +12,22 @@ import (
 
 // --- 对外接口 ---
 
-// GetExtensions 返回全部已安装扩展
+// GetExtensions 返回全部已安装扩展。返回副本避免并发修改。
 func (a *App) GetExtensions() []BrowserExtension {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	if a.extensions == nil {
 		return []BrowserExtension{}
 	}
-	return a.extensions
+	result := make([]BrowserExtension, len(a.extensions))
+	copy(result, a.extensions)
+	return result
 }
 
 // SetExtensionEnabled 设置扩展的全局启用状态
 func (a *App) SetExtensionEnabled(id string, enabled bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	for i := range a.extensions {
 		if a.extensions[i].ID == id {
 			a.extensions[i].Enabled = enabled
@@ -34,6 +40,8 @@ func (a *App) SetExtensionEnabled(id string, enabled bool) error {
 // SetExtensionPinned 设置图标是固定在地址栏旁，还是收进拼图面板。
 // 该设置写在 profile 副本的 manifest 里，需重启环境生效。
 func (a *App) SetExtensionPinned(id string, pinned bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	for i := range a.extensions {
 		if a.extensions[i].ID != id {
 			continue
@@ -49,6 +57,8 @@ func (a *App) SetExtensionPinned(id string, pinned bool) error {
 
 // DeleteExtension 卸载扩展，并清理各环境中对它的引用
 func (a *App) DeleteExtension(id string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	found := false
 	for i, ext := range a.extensions {
 		if ext.ID == id {
@@ -90,6 +100,8 @@ func (a *App) DeleteExtension(id string) error {
 
 // SetProfileExtensions 设置某个环境启用的扩展清单
 func (a *App) SetProfileExtensions(profileID string, extensionIDs []string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	known := make(map[string]bool, len(a.extensions))
 	for _, ext := range a.extensions {
 		known[ext.ID] = true
@@ -215,6 +227,8 @@ const extensionStampFile = ".mybrowser-stamp"
 
 // resolveEnabledExtensions 返回本环境实际生效的扩展：全局启用 ∩ 环境启用
 func (a *App) resolveEnabledExtensions(profile BrowserProfile) []BrowserExtension {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	if len(profile.EnabledExtensions) == 0 {
 		return nil
 	}

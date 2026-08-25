@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -24,12 +25,14 @@ import (
 	"syscall"
 	"time"
 	mrand "math/rand"
+	"unicode/utf8"
 
 
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"golang.org/x/net/proxy"
 
 	_ "modernc.org/sqlite"
 )
@@ -158,6 +161,9 @@ type App struct {
 	automationSessions   map[string]*AutomationSession
 	automationRuntimes   map[string]*automationSessionRuntime
 	automationMu         sync.RWMutex
+	// mu 保护 profiles / proxies / userScripts / extensions 四份内存索引。
+	// 除 UI 线程外，automation HTTP 服务与浏览器退出监听协程也会读写它们。
+	mu sync.RWMutex
 }
 
 type automationCreateRequest struct {
@@ -369,12 +375,6 @@ func (a *App) getLegacyDataDirs() ([]string, error) {
 
 func (a *App) getStorageModeLabel() string {
 	dataDir := filepath.Clean(a.getDataDir())
-	for _, baseDir := range uniquePaths(a.portableBaseDirs) {
-		if filepath.Clean(filepath.Join(baseDir, "MyBrowserData")) == dataDir {
-			return "portable"
-		}
-	}
-
 	baseDirs, err := a.getPortableBaseDirs()
 	if err == nil {
 		for _, baseDir := range baseDirs {
@@ -497,6 +497,103 @@ func (a *App) getDataDir() string {
 	return a.dataDir
 }
 
+// writeFileSync 原子化写入文件：先写临时文件再 rename 替换。
+// profiles.json 里存着 Cookie 登录存档，直接覆写一旦中途崩溃会把整份档案截断损坏。
+func writeFileSync(path string, data []byte) error {
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+// splitHostPort 拆分裸 host:port。用最后一个冒号切分，兼容未加方括号的 IPv6 地址。
+func splitHostPort(addr string) (string, string) {
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		return strings.Trim(addr[:i], "[]"), addr[i+1:]
+	}
+	return addr, ""
+}
+
+// parseProxyConfig 把代理字符串解析为 Firefox network.proxy.* 首选项键值。
+// 支持 http(s)://host:port、socks5://host:port、可选的 user:pass@ 前缀、
+// IPv6 [::1]:port 以及裸 host:port（视为 HTTP 代理）。
+// 返回 nil 表示解析不出可用的主机端口，调用方应按直连处理并告警。
+func parseProxyConfig(proxyStr string) map[string]string {
+	proxyStr = strings.TrimSpace(proxyStr)
+	if proxyStr == "" {
+		return nil
+	}
+
+	var scheme, host, port string
+	if strings.Contains(proxyStr, "://") {
+		u, err := url.Parse(proxyStr)
+		if err != nil || u.Host == "" {
+			return nil
+		}
+		scheme = strings.ToLower(u.Scheme)
+		host = u.Hostname()
+		port = u.Port()
+	} else {
+		scheme = "http"
+		host, port = splitHostPort(proxyStr)
+	}
+
+	if host == "" {
+		return nil
+	}
+	// Firefox 的端口首选项必须是纯数字
+	for _, r := range port {
+		if r < '0' || r > '9' {
+			return nil
+		}
+	}
+	if port == "" {
+		switch {
+		case strings.Contains(scheme, "socks"):
+			port = "1080"
+		case scheme == "https":
+			port = "443"
+		default:
+			port = "80"
+		}
+	}
+
+	prefs := map[string]string{
+		"network.proxy.type":                 "1",
+		"network.proxy.socks_remote_dns":     "true",
+		"network.proxy.share_proxy_settings": "true",
+	}
+	if strings.Contains(scheme, "socks") {
+		prefs["network.proxy.socks"] = fmt.Sprintf(`"%s"`, host)
+		prefs["network.proxy.socks_port"] = port
+		prefs["network.proxy.socks_version"] = "5"
+	} else {
+		// http 与 https 代理统一走同一入口；https scheme 的代理本质仍是 HTTP CONNECT
+		prefs["network.proxy.http"] = fmt.Sprintf(`"%s"`, host)
+		prefs["network.proxy.http_port"] = port
+		prefs["network.proxy.ssl"] = fmt.Sprintf(`"%s"`, host)
+		prefs["network.proxy.ssl_port"] = port
+	}
+	return prefs
+}
+
+// validateProxyString 校验代理字符串能否生成有效的代理配置。
+// 非法格式在保存时就拦下，避免"填了个坏地址，环境静默直连"这种难排查的情况。
+func validateProxyString(proxyStr string) error {
+	if strings.TrimSpace(proxyStr) == "" {
+		return nil
+	}
+	if parseProxyConfig(proxyStr) == nil {
+		return fmt.Errorf("代理格式无效，支持 http://host:port 或 socks5://host:port")
+	}
+	return nil
+}
+
 // getStoragePath 获取配置文件存储路径
 func (a *App) getStoragePath() string {
 	dir := a.getDataDir()
@@ -509,28 +606,43 @@ func (a *App) loadProfiles() {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		fmt.Printf("未找到配置文件，初始化默认数据: %v\n", err)
-		// 初始化一个默认环境
-		a.profiles = []BrowserProfile{
-			{
-				ID:       "default",
-				Name:     "默认环境 (Firefox)",
-				UA:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
-				Platform: "Windows",
-				Cookies:  "[]",
-				CreateAt: time.Now().Unix(),
-			},
-		}
-		a.saveProfiles()
+		a.initDefaultProfiles()
 		return
 	}
-	json.Unmarshal(data, &a.profiles)
+	if err := json.Unmarshal(data, &a.profiles); err != nil || a.profiles == nil {
+		// 索引损坏时绝不能拿空列表继续运行——后续任何一次保存都会把
+		// 原文件（连同其中的 Cookie 登录存档）覆盖掉。先留档再重建默认环境。
+		backup := path + ".corrupt"
+		if renameErr := os.Rename(path, backup); renameErr != nil {
+			backup = path + ".corrupt." + fmt.Sprint(time.Now().UnixNano())
+			_ = os.Rename(path, backup)
+		}
+		fmt.Printf("环境索引解析失败(%v)，原文件已留档为 %s，已重建默认环境\n", err, backup)
+		a.initDefaultProfiles()
+	}
+}
+
+func (a *App) initDefaultProfiles() {
+	a.profiles = []BrowserProfile{
+		{
+			ID:       "default",
+			Name:     "默认环境 (Firefox)",
+			UA:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
+			Platform: "Windows",
+			Cookies:  "[]",
+			CreateAt: time.Now().Unix(),
+		},
+	}
+	a.saveProfiles()
 }
 
 // saveProfiles 保存配置到文件
 func (a *App) saveProfiles() error {
-	path := a.getStoragePath()
-	data, _ := json.MarshalIndent(a.profiles, "", "  ")
-	return os.WriteFile(path, data, 0644)
+	data, err := json.MarshalIndent(a.profiles, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileSync(a.getStoragePath(), data)
 }
 
 // --- 代理池管理 ---
@@ -547,13 +659,20 @@ func (a *App) loadProxies() {
 		a.proxies = []ProxyEntry{}
 		return
 	}
-	json.Unmarshal(data, &a.proxies)
+	if err := json.Unmarshal(data, &a.proxies); err != nil || a.proxies == nil {
+		backup := path + ".corrupt"
+		_ = os.Rename(path, backup)
+		fmt.Printf("代理池索引解析失败(%v)，原文件已留档为 %s\n", err, backup)
+		a.proxies = []ProxyEntry{}
+	}
 }
 
 func (a *App) saveProxies() error {
-	path := a.getProxyStoragePath()
-	data, _ := json.MarshalIndent(a.proxies, "", "  ")
-	return os.WriteFile(path, data, 0644)
+	data, err := json.MarshalIndent(a.proxies, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileSync(a.getProxyStoragePath(), data)
 }
 
 // --- 用户脚本（油猴脚本）管理 ---
@@ -755,7 +874,7 @@ func (a *App) saveUserScripts() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(a.getUserScriptStoragePath(), data, 0644)
+	return writeFileSync(a.getUserScriptStoragePath(), data)
 }
 
 // isValidMatchPattern 判断是否为 Gecko 可接受的匹配模式。
@@ -874,7 +993,7 @@ func (a *App) saveAutomationConfig() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return writeFileSync(path, data)
 }
 
 func generateAutomationToken() (string, error) {
@@ -1237,10 +1356,17 @@ func (a *App) watchAutomationPipe(sessionID, stream string, reader io.ReadCloser
 }
 
 func (a *App) GetProxies() []ProxyEntry {
-	return a.proxies
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	result := make([]ProxyEntry, len(a.proxies))
+	copy(result, a.proxies)
+	return result
 }
 
 func (a *App) AddProxy(name, proxyStr string) (ProxyEntry, error) {
+	if err := validateProxyString(proxyStr); err != nil {
+		return ProxyEntry{}, err
+	}
 	entry := ProxyEntry{
 		ID:        uuid.New().String(),
 		Name:      name,
@@ -1248,6 +1374,8 @@ func (a *App) AddProxy(name, proxyStr string) (ProxyEntry, error) {
 		Status:    "unknown",
 		UpdatedAt: time.Now().Unix(),
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.proxies = append(a.proxies, entry)
 	err := a.saveProxies()
 	a.Log("info", fmt.Sprintf("添加代理成功: %s (%s)", name, proxyStr))
@@ -1255,6 +1383,8 @@ func (a *App) AddProxy(name, proxyStr string) (ProxyEntry, error) {
 }
 
 func (a *App) DeleteProxy(id string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	for i, p := range a.proxies {
 		if p.ID == id {
 			a.proxies = append(a.proxies[:i], a.proxies[i+1:]...)
@@ -1266,6 +1396,11 @@ func (a *App) DeleteProxy(id string) error {
 }
 
 func (a *App) UpdateProxy(updated ProxyEntry) error {
+	if err := validateProxyString(updated.Proxy); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	for i, p := range a.proxies {
 		if p.ID == updated.ID {
 			a.proxies[i] = updated
@@ -1277,12 +1412,16 @@ func (a *App) UpdateProxy(updated ProxyEntry) error {
 
 // --- 用户脚本对外接口 ---
 
-// GetUserScripts 返回全部用户脚本的元数据（不含正文）
+// GetUserScripts 返回全部用户脚本的元数据（不含正文）。返回副本避免并发修改。
 func (a *App) GetUserScripts() []UserScript {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	if a.userScripts == nil {
 		return []UserScript{}
 	}
-	return a.userScripts
+	result := make([]UserScript, len(a.userScripts))
+	copy(result, a.userScripts)
+	return result
 }
 
 // GetUserScriptSource 读取脚本正文
@@ -1307,6 +1446,7 @@ func (a *App) SaveUserScript(id, source string) (UserScript, error) {
 
 	parsed := parseUserScriptMeta(source)
 
+	a.mu.Lock()
 	var target *UserScript
 	for i := range a.userScripts {
 		if a.userScripts[i].ID == id {
@@ -1343,26 +1483,41 @@ func (a *App) SaveUserScript(id, source string) (UserScript, error) {
 	target.UpdatedAt = time.Now().Unix()
 
 	if err := os.WriteFile(a.getUserScriptSourcePath(target.ID), []byte(source), 0644); err != nil {
+		a.mu.Unlock()
 		return UserScript{}, fmt.Errorf("写入脚本文件失败: %v", err)
 	}
 
+	// 锁内固化快照后立即放锁：依赖下载是秒级网络操作，
+	// 攥着索引锁下载会卡死其他线程的读写
+	snapshot := *target
+	a.mu.Unlock()
+
 	// 下载 @require / @resource；失败不阻断保存，由兼容性检查汇报
-	a.downloadScriptAssets(target)
+	a.downloadScriptAssets(&snapshot)
 
-	result := *target
+	a.mu.Lock()
+	for i := range a.userScripts {
+		if a.userScripts[i].ID == snapshot.ID {
+			a.userScripts[i].RequireAssets = snapshot.RequireAssets
+			a.userScripts[i].ResourceAssets = snapshot.ResourceAssets
+			break
+		}
+	}
 	if err := a.saveUserScripts(); err != nil {
-		return result, err
+		a.mu.Unlock()
+		return snapshot, err
 	}
+	a.mu.Unlock()
 
-	a.Log("info", fmt.Sprintf("已保存用户脚本: %s", result.Name))
-	if len(result.Matches) == 0 {
-		a.Log("warn", fmt.Sprintf("脚本 [%s] 未解析到合法的 @match 规则，启用后不会生效", result.Name))
+	a.Log("info", fmt.Sprintf("已保存用户脚本: %s", snapshot.Name))
+	if len(snapshot.Matches) == 0 {
+		a.Log("warn", fmt.Sprintf("脚本 [%s] 未解析到合法的 @match 规则，启用后不会生效", snapshot.Name))
 	}
-	if blockers := unsupportedScriptFeatures(result); len(blockers) > 0 {
+	if blockers := unsupportedScriptFeatures(snapshot); len(blockers) > 0 {
 		a.Log("warn", fmt.Sprintf("脚本 [%s] 使用了当前引擎尚未支持的能力（%s），启用后不会正常工作",
-			result.Name, strings.Join(blockers, "、")))
+			snapshot.Name, strings.Join(blockers, "、")))
 	}
-	return result, nil
+	return snapshot, nil
 }
 
 // unsupportedScriptFeatures 返回脚本用到、但本引擎不支持的能力。
@@ -1393,6 +1548,9 @@ func unsupportedScriptFeatures(script UserScript) []string {
 
 // RedownloadScriptAssets 重新下载指定脚本的外部依赖，供下载失败后重试
 func (a *App) RedownloadScriptAssets(id string) (UserScript, error) {
+	a.mu.Lock()
+	var snapshot UserScript
+	found := false
 	for i := range a.userScripts {
 		if a.userScripts[i].ID != id {
 			continue
@@ -1400,15 +1558,32 @@ func (a *App) RedownloadScriptAssets(id string) (UserScript, error) {
 		// 清空既有记录以强制重新拉取，避免命中"复用"分支
 		a.userScripts[i].RequireAssets = nil
 		a.userScripts[i].ResourceAssets = nil
-		a.downloadScriptAssets(&a.userScripts[i])
-
-		result := a.userScripts[i]
-		if err := a.saveUserScripts(); err != nil {
-			return result, err
-		}
-		return result, nil
+		snapshot = a.userScripts[i]
+		found = true
+		break
 	}
-	return UserScript{}, fmt.Errorf("未找到脚本")
+	a.mu.Unlock()
+	if !found {
+		return UserScript{}, fmt.Errorf("未找到脚本")
+	}
+
+	// 下载放锁外进行，理由同 SaveUserScript
+	a.downloadScriptAssets(&snapshot)
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := range a.userScripts {
+		if a.userScripts[i].ID == id {
+			a.userScripts[i].RequireAssets = snapshot.RequireAssets
+			a.userScripts[i].ResourceAssets = snapshot.ResourceAssets
+			snapshot = a.userScripts[i]
+			break
+		}
+	}
+	if err := a.saveUserScripts(); err != nil {
+		return snapshot, err
+	}
+	return snapshot, nil
 }
 
 // SetUserScriptWorld 设置脚本的运行世界。
@@ -1417,6 +1592,8 @@ func (a *App) SetUserScriptWorld(id, world string) error {
 	if world != "isolated" && world != "page" {
 		return fmt.Errorf("无效的运行模式: %s", world)
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	for i := range a.userScripts {
 		if a.userScripts[i].ID == id {
 			a.userScripts[i].World = world
@@ -1429,6 +1606,8 @@ func (a *App) SetUserScriptWorld(id, world string) error {
 
 // SetUserScriptEnabled 设置脚本的全局启用状态
 func (a *App) SetUserScriptEnabled(id string, enabled bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	for i := range a.userScripts {
 		if a.userScripts[i].ID == id {
 			a.userScripts[i].Enabled = enabled
@@ -1441,6 +1620,8 @@ func (a *App) SetUserScriptEnabled(id string, enabled bool) error {
 
 // DeleteUserScript 删除脚本，并清理所有环境中对它的引用
 func (a *App) DeleteUserScript(id string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	found := false
 	for i, s := range a.userScripts {
 		if s.ID == id {
@@ -1487,6 +1668,8 @@ func (a *App) DeleteUserScript(id string) error {
 
 // SetProfileScripts 设置某个环境启用的脚本清单
 func (a *App) SetProfileScripts(profileID string, scriptIDs []string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	known := make(map[string]bool, len(a.userScripts))
 	for _, s := range a.userScripts {
 		known[s.ID] = true
@@ -1598,27 +1781,43 @@ func (a *App) ImportUserScriptFromFile() (UserScript, error) {
 }
 
 func (a *App) TestProxyEntry(id string) (string, error) {
-	var target *ProxyEntry
-	for i, p := range a.proxies {
+	// 先取出地址立即放锁：连通性测试是秒级网络请求，不能攥着索引锁等待
+	a.mu.Lock()
+	var proxyStr string
+	found := false
+	for _, p := range a.proxies {
 		if p.ID == id {
-			target = &a.proxies[i]
+			proxyStr = p.Proxy
+			found = true
 			break
 		}
 	}
-	if target == nil {
+	a.mu.Unlock()
+	if !found {
 		return "", fmt.Errorf("代理不存在")
 	}
 
-	res, err := a.TestProxy(target.Proxy)
-	if err == nil {
-		target.Status = "online"
-		target.Latency = res
-	} else {
-		target.Status = "offline"
-		target.Latency = "N/A"
+	res, err := a.TestProxy(proxyStr)
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := range a.proxies {
+		if a.proxies[i].ID != id {
+			continue
+		}
+		if err == nil {
+			a.proxies[i].Status = "online"
+			a.proxies[i].Latency = res
+		} else {
+			a.proxies[i].Status = "offline"
+			a.proxies[i].Latency = "N/A"
+		}
+		a.proxies[i].UpdatedAt = time.Now().Unix()
+		if saveErr := a.saveProxies(); saveErr != nil && err == nil {
+			return res, saveErr
+		}
+		break
 	}
-	target.UpdatedAt = time.Now().Unix()
-	a.saveProxies()
 	return res, err
 }
 
@@ -1690,6 +1889,9 @@ func (a *App) CreateProfile(name, proxy, ua, startURL, category string) (Browser
 	if err != nil {
 		return BrowserProfile{}, err
 	}
+	if err := validateProxyString(proxy); err != nil {
+		return BrowserProfile{}, err
+	}
 
 	newProfile := BrowserProfile{
 		ID:       uuid.New().String(),
@@ -1702,6 +1904,8 @@ func (a *App) CreateProfile(name, proxy, ua, startURL, category string) (Browser
 		Cookies:  "[]",
 		CreateAt: time.Now().Unix(),
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.profiles = append(a.profiles, newProfile)
 	err = a.saveProfiles()
 	return newProfile, err
@@ -1709,9 +1913,14 @@ func (a *App) CreateProfile(name, proxy, ua, startURL, category string) (Browser
 
 // DeleteProfile 删除环境
 func (a *App) DeleteProfile(id string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	for i, p := range a.profiles {
 		if p.ID == id {
 			a.profiles = append(a.profiles[:i], a.profiles[i+1:]...)
+			// profile 数据目录（含浏览痕迹）保留在磁盘上，交由用户自行决定是否清理
+			a.Log("info", fmt.Sprintf("环境已删除，其数据目录仍保留于 %s",
+				filepath.Join(a.getDataDir(), "profiles", id)))
 			return a.saveProfiles()
 		}
 	}
@@ -1724,9 +1933,14 @@ func (a *App) UpdateProfile(updated BrowserProfile) error {
 	if err != nil {
 		return err
 	}
+	if err := validateProxyString(updated.Proxy); err != nil {
+		return err
+	}
 	updated.StartURL = normalizedStartURL
 	updated.Category = normalizeCategory(updated.Category)
 
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	for i, p := range a.profiles {
 		if p.ID == updated.ID {
 			a.profiles[i] = updated
@@ -1850,6 +2064,8 @@ func (a *App) stopAutomationServer() error {
 
 func (a *App) withAutomationCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 本地 API 只接受小体积 JSON，限制请求体防止恶意进程灌大包耗尽内存
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
@@ -1873,7 +2089,8 @@ func (a *App) requireAutomationAuth(w http.ResponseWriter, r *http.Request, requ
 
 	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
 	expected := "Bearer " + token
-	if authHeader != expected {
+	// 常量时间比较，避免逐字节短路造成的时序侧信道
+	if subtle.ConstantTimeCompare([]byte(authHeader), []byte(expected)) != 1 {
 		a.writeAutomationJSON(w, http.StatusUnauthorized, requestID, nil, &automationErrorPayload{
 			Code:    "unauthorized",
 			Message: "缺少有效的 Bearer token",
@@ -1922,6 +2139,7 @@ func (a *App) handleAutomationProfiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	summaries := make([]AutomationProfileSummary, 0, len(a.profiles))
+	a.mu.RLock()
 	for _, profile := range a.profiles {
 		summaries = append(summaries, AutomationProfileSummary{
 			ID:       profile.ID,
@@ -1933,6 +2151,7 @@ func (a *App) handleAutomationProfiles(w http.ResponseWriter, r *http.Request) {
 			CreateAt: profile.CreateAt,
 		})
 	}
+	a.mu.RUnlock()
 	a.writeAutomationJSON(w, http.StatusOK, requestID, summaries, nil)
 }
 
@@ -2131,49 +2350,17 @@ func (a *App) setupStealthPrefs(userDataDir, proxyStr string) error {
 
 	// 解析代理配置
 	if proxyStr != "" {
-		var proxyType int = 1
-		var httpHost, httpPort string
-		var sslHost, sslPort string
-		var socksHost, socksPort string
-		var socksVersion int = 5
-
-		tempProxy := proxyStr
-		if strings.Contains(tempProxy, "://") {
-			parts := strings.Split(tempProxy, "://")
-			protocol := parts[0]
-			addr := parts[1]
-
-			hostPort := strings.Split(addr, ":")
-			if len(hostPort) == 2 {
-				if protocol == "http" || protocol == "https" {
-					httpHost, httpPort = hostPort[0], hostPort[1]
-					sslHost, sslPort = hostPort[0], hostPort[1]
-				} else if strings.Contains(protocol, "socks") {
-					socksHost, socksPort = hostPort[0], hostPort[1]
-				}
+		if proxyPrefs := parseProxyConfig(proxyStr); proxyPrefs != nil {
+			for key, val := range proxyPrefs {
+				prefsMap[key] = val
+			}
+			// Firefox 的手动代理首选项无法携带账号密码，提前说明而不是让用户对着 407 排查
+			if u, err := url.Parse(strings.TrimSpace(proxyStr)); err == nil && u.User != nil {
+				a.Log("warn", "代理包含账号密码，Firefox 手动代理不支持凭据注入，连接时可能要求手工输入或直接失败")
 			}
 		} else {
-			hostPort := strings.Split(tempProxy, ":")
-			if len(hostPort) == 2 {
-				httpHost, httpPort = hostPort[0], hostPort[1]
-				sslHost, sslPort = hostPort[0], hostPort[1]
-			}
+			a.Log("warn", fmt.Sprintf("代理 %q 无法解析，本环境将按直连启动", proxyStr))
 		}
-
-		prefsMap["network.proxy.type"] = fmt.Sprintf("%d", proxyType)
-		if httpHost != "" && httpPort != "" {
-			prefsMap["network.proxy.http"] = fmt.Sprintf(`"%s"`, httpHost)
-			prefsMap["network.proxy.http_port"] = httpPort
-			prefsMap["network.proxy.ssl"] = fmt.Sprintf(`"%s"`, sslHost)
-			prefsMap["network.proxy.ssl_port"] = sslPort
-		}
-		if socksHost != "" && socksPort != "" {
-			prefsMap["network.proxy.socks"] = fmt.Sprintf(`"%s"`, socksHost)
-			prefsMap["network.proxy.socks_port"] = socksPort
-			prefsMap["network.proxy.socks_version"] = fmt.Sprintf("%d", socksVersion)
-		}
-		prefsMap["network.proxy.socks_remote_dns"] = "true"
-		prefsMap["network.proxy.share_proxy_settings"] = "true"
 	}
 
 	// 重构 prefs.js 的内容
@@ -2199,9 +2386,15 @@ func (a *App) setupStealthPrefs(userDataDir, proxyStr string) error {
 		}
 	}
 
-	// 写入新的配置
-	for key, val := range prefsMap {
-		newLines = append(newLines, fmt.Sprintf(`user_pref("%s", %s);`, key, val))
+	// 写入新的配置。按键排序保证多次生成的内容逐字节稳定，
+	// 也让 prefs.js 在同步/比对工具眼里没有无意义的抖动。
+	keys := make([]string, 0, len(prefsMap))
+	for key := range prefsMap {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		newLines = append(newLines, fmt.Sprintf(`user_pref("%s", %s);`, key, prefsMap[key]))
 	}
 
 	output := strings.Join(newLines, "\n") + "\n"
@@ -2251,23 +2444,6 @@ func (a *App) generateFingerprintConfig(profile BrowserProfile) map[string]inter
 	config["locale:all"] = "zh-CN"
 
 	return config
-}
-
-// injectCamouConfig 将配置 JSON 分片注入环境变量
-func (a *App) injectCamouConfig(config map[string]interface{}) {
-	data, _ := json.Marshal(config)
-	configStr := string(data)
-
-	// Windows 环境变量大小限制约 2047-8191 字符，这里保守使用 2000
-	chunkSize := 2000
-	for i := 0; i < len(configStr); i += chunkSize {
-		end := i + chunkSize
-		if end > len(configStr) {
-			end = len(configStr)
-		}
-		envName := fmt.Sprintf("CAMOU_CONFIG_%d", (i/chunkSize)+1)
-		os.Setenv(envName, configStr[i:end])
-	}
 }
 
 // setupCookies 物理注入 Cookie 到 Firefox 的 cookies.sqlite
@@ -2380,6 +2556,8 @@ const userScriptExtID = "userscript-engine@mybrowser.local"
 
 // resolveEnabledScripts 返回本环境实际生效的脚本：全局启用 ∩ 环境启用 ∩ 具备合法匹配规则。
 func (a *App) resolveEnabledScripts(profile BrowserProfile) []UserScript {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	if len(profile.EnabledScripts) == 0 {
 		return nil
 	}
@@ -2555,6 +2733,8 @@ s.remove();
 
 // SyncCookies 从浏览器的物理数据库中提取 Cookie 并同步到配置文件
 func (a *App) SyncCookies(profileID string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	var profile *BrowserProfile
 	var profileIdx int
 	found := false
@@ -2632,6 +2812,8 @@ func (a *App) SyncCookies(profileID string) error {
 
 // ResetCookies 重置指定的环境的 Cookie 记录并物理删除数据库文件
 func (a *App) ResetCookies(profileID string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	var profileIdx int
 	found := false
 	for i, p := range a.profiles {
@@ -2646,7 +2828,8 @@ func (a *App) ResetCookies(profileID string) error {
 		return fmt.Errorf("环境不存在")
 	}
 
-	// 物理删除 cookies.sqlite 文件
+	// 物理删除 cookies.sqlite 文件（连同 WAL 旁车文件，
+	// 否则残留的 WAL 可能被新库重放，导致"清空后旧 Cookie 复活"）
 	userDataDir := filepath.Join(a.getDataDir(), "profiles", profileID)
 	dbPath := filepath.Join(userDataDir, "cookies.sqlite")
 	if _, err := os.Stat(dbPath); err == nil {
@@ -2656,6 +2839,8 @@ func (a *App) ResetCookies(profileID string) error {
 			return fmt.Errorf("物理文件删除失败（请确认浏览器已关闭）: %v", err)
 		}
 	}
+	os.Remove(dbPath + "-wal")
+	os.Remove(dbPath + "-shm")
 
 	// 同时清理 sessionstore 等可能包含状态的文件
 	_ = profileIdx // 保持变量以匹配 SyncCookies 逻辑风格，或直接移除
@@ -2666,8 +2851,11 @@ func (a *App) ResetCookies(profileID string) error {
 	return a.saveProfiles()
 }
 
-// TestProxy 验证代理连通性
+// TestProxy 验证代理连通性。
+// SOCKS5 走真实拨号 + HTTP 请求测量延迟，不再像旧实现那样只校验格式——
+// "格式有效但实际不通"正是排障时最常见的坑（如代理客户端未监听对应端口）。
 func (a *App) TestProxy(proxyStr string) (string, error) {
+	proxyStr = strings.TrimSpace(proxyStr)
 	if proxyStr == "" {
 		return "直连", nil
 	}
@@ -2677,32 +2865,49 @@ func (a *App) TestProxy(proxyStr string) (string, error) {
 		return "", fmt.Errorf("格式非法: %v", err)
 	}
 
-	client := &http.Client{
-		Timeout: 5 * time.Second,
+	client := &http.Client{Timeout: 8 * time.Second}
+	switch {
+	case u.Scheme == "http" || u.Scheme == "https":
+		client.Transport = &http.Transport{Proxy: http.ProxyURL(u)}
+	case strings.HasPrefix(u.Scheme, "socks"):
+		if u.Port() == "" {
+			return "", fmt.Errorf("缺少端口，格式应为 socks5://host:port")
+		}
+		var auth *proxy.Auth
+		if u.User != nil {
+			password, _ := u.User.Password()
+			auth = &proxy.Auth{User: u.User.Username(), Password: password}
+		}
+		dialer, dialErr := proxy.SOCKS5("tcp", net.JoinHostPort(u.Hostname(), u.Port()), auth, proxy.Direct)
+		if dialErr != nil {
+			return "", fmt.Errorf("创建 SOCKS5 连接器失败: %v", dialErr)
+		}
+		contextDialer, ok := dialer.(proxy.ContextDialer)
+		if !ok {
+			return "", fmt.Errorf("SOCKS5 连接器不支持上下文拨号")
+		}
+		client.Transport = &http.Transport{DialContext: contextDialer.DialContext}
+	default:
+		return "", fmt.Errorf("暂不支持的代理协议: %s", u.Scheme)
 	}
 
-	if u.Scheme == "http" || u.Scheme == "https" {
-		proxyURL, _ := url.Parse(proxyStr)
-		client.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
-	} else if strings.Contains(u.Scheme, "socks") {
-		// 这里简单处理，Camoufox 本身支持 socks，Go 测试连通性也可以使用类似逻辑
-		// 为保持代码轻量，此处仅验证格式，或尝试建立基础 TCP 连接
-		return "SOCKS 代理格式有效，连通性请在启动后验证", nil
-	}
-
-	resp, err := client.Get("https://www.google.com")
+	start := time.Now()
+	resp, err := client.Get("https://www.gstatic.com/generate_204")
 	if err != nil {
 		return "", fmt.Errorf("无法连接: %v", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 200 {
-		return "连接成功", nil
+	latency := time.Since(start).Round(time.Millisecond)
+	if resp.StatusCode == http.StatusOK {
+		return fmt.Sprintf("连接成功 (%s)", latency), nil
 	}
-	return fmt.Sprintf("状态码: %d", resp.StatusCode), nil
+	return fmt.Sprintf("状态码: %d (%s)", resp.StatusCode, latency), nil
 }
 
 func (a *App) getProfileByID(profileID string) (BrowserProfile, error) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	for _, p := range a.profiles {
 		if p.ID == profileID {
 			return p, nil
@@ -2711,6 +2916,8 @@ func (a *App) getProfileByID(profileID string) (BrowserProfile, error) {
 	return BrowserProfile{}, fmt.Errorf("环境不存在")
 }
 
+// ensureUniqueProfileName 生成不与现有环境重名的名称。
+// 调用方须已持有 a.mu 写锁（当前仅 importProfileBundle 使用）。
 func (a *App) ensureUniqueProfileName(baseName string) string {
 	if strings.TrimSpace(baseName) == "" {
 		baseName = "导入环境"
@@ -2829,6 +3036,8 @@ func (a *App) exportProfileBundle(profile BrowserProfile, targetPath string) err
 // 打包的是"被引用"而非"实际生效"的脚本：全局停用的脚本同样随包带走，
 // 否则在目标机器上重新启用后会发现脚本不存在。
 func (a *App) writeUserScriptsToBundle(zipWriter *zip.Writer, profile BrowserProfile) error {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	if len(profile.EnabledScripts) == 0 {
 		return nil
 	}
@@ -2880,6 +3089,8 @@ func (a *App) writeUserScriptsToBundle(zipWriter *zip.Writer, profile BrowserPro
 //
 // 导入的脚本一律保持全局停用：环境包可能来自他人，其中的脚本会在匹配站点上
 // 执行任意代码，需由用户确认内容后再显式启用。
+//
+// 调用方须已持有 a.mu 写锁（当前仅 importProfileBundle 使用）。
 func (a *App) restoreBundledUserScripts(zipReader *zip.Reader) (map[string]string, error) {
 	var index []UserScript
 	sources := make(map[string][]byte)
@@ -3000,6 +3211,10 @@ func remapImportedScriptIDs(ids []string, idMap map[string]string) []string {
 	return result
 }
 
+// maxProfileBundleSize 限制环境包解压后的总体积，防止压缩炸弹撑爆磁盘。
+// 真实环境的 profile（含 places/cache 等数据库）可达数百 MB，此处留足余量。
+const maxProfileBundleSize = 512 << 20
+
 func (a *App) importProfileBundle(sourcePath string) (BrowserProfile, error) {
 	zipReader, err := zip.OpenReader(sourcePath)
 	if err != nil {
@@ -3045,11 +3260,14 @@ func (a *App) importProfileBundle(sourcePath string) (BrowserProfile, error) {
 	}
 
 	profile.ID = uuid.New().String()
-	profile.Name = a.ensureUniqueProfileName(profile.Name)
 	profile.CreateAt = time.Now().Unix()
 
-	// 还原随包携带的用户脚本，并把启用清单里的旧 ID 换成本机新 ID
+	// 还原随包携带的用户脚本，并把启用清单里的旧 ID 换成本机新 ID。
+	// 查重名与改索引都在锁内完成，随后的文件解压不阻塞其他线程。
+	a.mu.Lock()
+	profile.Name = a.ensureUniqueProfileName(profile.Name)
 	scriptIDMap, err := a.restoreBundledUserScripts(&zipReader.Reader)
+	a.mu.Unlock()
 	if err != nil {
 		return BrowserProfile{}, err
 	}
@@ -3060,9 +3278,15 @@ func (a *App) importProfileBundle(sourcePath string) (BrowserProfile, error) {
 		return BrowserProfile{}, err
 	}
 
+	var unpacked int64
 	for _, file := range zipReader.File {
 		if !strings.HasPrefix(file.Name, "data/") {
 			continue
+		}
+
+		unpacked += int64(file.UncompressedSize64)
+		if unpacked > maxProfileBundleSize {
+			return BrowserProfile{}, fmt.Errorf("环境包解压后超过 %d MiB，已中止导入", maxProfileBundleSize>>20)
 		}
 
 		targetPath, err := safeJoinProfileDataPath(newUserDataDir, file.Name)
@@ -3106,10 +3330,13 @@ func (a *App) importProfileBundle(sourcePath string) (BrowserProfile, error) {
 		}
 	}
 
+	a.mu.Lock()
 	a.profiles = append(a.profiles, profile)
 	if err := a.saveProfiles(); err != nil {
+		a.mu.Unlock()
 		return BrowserProfile{}, err
 	}
+	a.mu.Unlock()
 
 	return profile, nil
 }
@@ -3162,13 +3389,22 @@ func (a *App) buildCamoufoxEnv(profile BrowserProfile) []string {
 
 	configStr := string(data)
 	chunkSize := 2000
-	for i := 0; i < len(configStr); i += chunkSize {
+	chunkIndex := 1
+	for i := 0; i < len(configStr); {
 		end := i + chunkSize
 		if end > len(configStr) {
 			end = len(configStr)
+		} else {
+			// 回退到 UTF-8 字符边界。Windows 环境变量要经过 UTF-16 转换，
+			// 被拦腰切开的多字节字符会变成 U+FFFD 丢字。
+			for end > i && end < len(configStr) && !utf8.RuneStart(configStr[end]) {
+				end--
+			}
 		}
-		envName := fmt.Sprintf("CAMOU_CONFIG_%d", (i/chunkSize)+1)
+		envName := fmt.Sprintf("CAMOU_CONFIG_%d", chunkIndex)
 		filtered = append(filtered, envName+"="+configStr[i:end])
+		chunkIndex++
+		i = end
 	}
 
 	filtered = append(filtered, "CAMOU_UA="+profile.UA)
@@ -3320,9 +3556,13 @@ func (a *App) StopAutomationSession(sessionID string) error {
 	return nil
 }
 
-// GetProfiles 获取所有环境列表
+// GetProfiles 获取所有环境列表。返回副本，避免调用方持有切片期间后端并发修改。
 func (a *App) GetProfiles() []BrowserProfile {
-	return a.profiles
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	result := make([]BrowserProfile, len(a.profiles))
+	copy(result, a.profiles)
+	return result
 }
 
 // --- 导入导出迁移功能 ---

@@ -72,7 +72,7 @@ func (a *App) saveExtensions() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(a.getExtensionStoragePath(), data, 0644)
+	return writeFileSync(a.getExtensionStoragePath(), data)
 }
 
 // --- manifest 解析 ---
@@ -315,11 +315,14 @@ func (a *App) InstallExtensionFromPath(sourcePath string) (BrowserExtension, err
 		ext.GeckoIDInjected = true
 	}
 
+	a.mu.Lock()
 	a.extensions = append(a.extensions, ext)
 	if err := a.saveExtensions(); err != nil {
+		a.mu.Unlock()
 		cleanup()
 		return BrowserExtension{}, err
 	}
+	a.mu.Unlock()
 
 	a.Log("info", fmt.Sprintf("已安装扩展: %s %s", ext.Name, ext.Version))
 	if len(ext.Incompatible) > 0 {
