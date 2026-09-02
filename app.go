@@ -2348,12 +2348,17 @@ func (a *App) setupStealthPrefs(userDataDir, proxyStr string) error {
 		"xpinstall.signatures.required": "false", // 允许自建的未签名引擎（Camoufox 默认已关闭强制签名）
 	}
 
-	// 解析代理配置
+	// 解析代理配置。直连时显式写入 type=0；无论走不走代理，
+	// prefs.js 里的历史 network.proxy.* 行都会先清掉（见下方过滤），
+	// 否则环境从"挂代理"切回"直连"后会沿用上次写死的代理地址，
+	// 报 "The proxy server is refusing connections"。
+	direct := true
 	if proxyStr != "" {
 		if proxyPrefs := parseProxyConfig(proxyStr); proxyPrefs != nil {
 			for key, val := range proxyPrefs {
 				prefsMap[key] = val
 			}
+			direct = false
 			// Firefox 的手动代理首选项无法携带账号密码，提前说明而不是让用户对着 407 排查
 			if u, err := url.Parse(strings.TrimSpace(proxyStr)); err == nil && u.User != nil {
 				a.Log("warn", "代理包含账号密码，Firefox 手动代理不支持凭据注入，连接时可能要求手工输入或直接失败")
@@ -2361,6 +2366,9 @@ func (a *App) setupStealthPrefs(userDataDir, proxyStr string) error {
 		} else {
 			a.Log("warn", fmt.Sprintf("代理 %q 无法解析，本环境将按直连启动", proxyStr))
 		}
+	}
+	if direct {
+		prefsMap["network.proxy.type"] = "0"
 	}
 
 	// 重构 prefs.js 的内容
@@ -2371,6 +2379,11 @@ func (a *App) setupStealthPrefs(userDataDir, proxyStr string) error {
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
+			continue
+		}
+		// 代理首选项一律不保留历史行：手动代理的键集合随代理类型变化
+		// （http 切 socks 会残留 socks 键），所需子集由本次 prefsMap 统一重写
+		if strings.HasPrefix(trimmed, `user_pref("network.proxy.`) {
 			continue
 		}
 		// 检查这行是否包含我们要设置的 key

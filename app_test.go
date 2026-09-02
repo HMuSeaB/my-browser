@@ -1681,3 +1681,119 @@ func writeTestProfileBundle(path string, metadata BrowserProfile, files map[stri
 
 	return nil
 }
+
+// 把 prefs.js 解析成 key -> value 的映射，方便断言。
+func parsePrefsFile(t *testing.T, path string) map[string]string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read prefs.js: %v", err)
+	}
+	prefs := map[string]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, `user_pref("`) {
+			continue
+		}
+		line = strings.TrimPrefix(line, `user_pref("`)
+		idx := strings.Index(line, `", `)
+		if idx < 0 {
+			continue
+		}
+		prefs[line[:idx]] = strings.TrimSuffix(strings.TrimSpace(line[idx+3:]), ");")
+	}
+	return prefs
+}
+
+// 直连环境下必须清掉 prefs.js 里的历史代理配置，否则环境切回直连后
+// 仍会沿用上次写死的代理地址，报 "proxy server is refusing connections"。
+func TestSetupStealthPrefsClearsStaleProxyOnDirect(t *testing.T) {
+	app := &App{}
+	dir := t.TempDir()
+	stale := `user_pref("dom.webdriver.enabled", false);
+user_pref("network.proxy.share_proxy_settings", true);
+user_pref("network.proxy.socks", "127.0.0.1");
+user_pref("network.proxy.socks_port", 7891);
+user_pref("network.proxy.socks_remote_dns", true);
+user_pref("network.proxy.type", 1);
+user_pref("browser.startup.homepage", "https://example.com");
+`
+	if err := os.WriteFile(filepath.Join(dir, "prefs.js"), []byte(stale), 0644); err != nil {
+		t.Fatalf("seed prefs.js: %v", err)
+	}
+
+	if err := app.setupStealthPrefs(dir, ""); err != nil {
+		t.Fatalf("setupStealthPrefs: %v", err)
+	}
+
+	prefs := parsePrefsFile(t, filepath.Join(dir, "prefs.js"))
+	if prefs["network.proxy.type"] != "0" {
+		t.Fatalf("network.proxy.type = %q, want 0", prefs["network.proxy.type"])
+	}
+	for _, key := range []string{
+		"network.proxy.socks",
+		"network.proxy.socks_port",
+		"network.proxy.socks_remote_dns",
+		"network.proxy.share_proxy_settings",
+	} {
+		if val, ok := prefs[key]; ok {
+			t.Fatalf("stale proxy pref %s = %s survived direct launch", key, val)
+		}
+	}
+	if prefs["dom.webdriver.enabled"] != "false" {
+		t.Fatalf("dom.webdriver.enabled = %q, want preserved", prefs["dom.webdriver.enabled"])
+	}
+	if prefs["browser.startup.homepage"] != `"https://example.com"` {
+		t.Fatalf("browser.startup.homepage = %q, want preserved", prefs["browser.startup.homepage"])
+	}
+}
+
+// 从 socks 代理切成 http 代理时，socks 相关键不能残留，
+// 否则两套手动代理配置混在一起，排查起来非常困难。
+func TestSetupStealthPrefsSwitchingProxyTypeLeavesNoStaleKeys(t *testing.T) {
+	app := &App{}
+	dir := t.TempDir()
+	prev := `user_pref("network.proxy.socks", "127.0.0.1");
+user_pref("network.proxy.socks_port", 7891);
+user_pref("network.proxy.socks_version", 5);
+user_pref("network.proxy.type", 1);
+`
+	if err := os.WriteFile(filepath.Join(dir, "prefs.js"), []byte(prev), 0644); err != nil {
+		t.Fatalf("seed prefs.js: %v", err)
+	}
+
+	if err := app.setupStealthPrefs(dir, "http://127.0.0.1:7890"); err != nil {
+		t.Fatalf("setupStealthPrefs: %v", err)
+	}
+
+	prefs := parsePrefsFile(t, filepath.Join(dir, "prefs.js"))
+	for _, key := range []string{"network.proxy.socks", "network.proxy.socks_port", "network.proxy.socks_version"} {
+		if val, ok := prefs[key]; ok {
+			t.Fatalf("stale pref %s = %s survived proxy switch", key, val)
+		}
+	}
+	if prefs["network.proxy.type"] != "1" {
+		t.Fatalf("network.proxy.type = %q, want 1", prefs["network.proxy.type"])
+	}
+	if prefs["network.proxy.http"] != `"127.0.0.1"` || prefs["network.proxy.http_port"] != "7890" {
+		t.Fatalf("http proxy prefs = %v, want 127.0.0.1:7890", prefs)
+	}
+}
+
+// 挂代理的环境重启动后代理配置应当完整写入。
+func TestSetupStealthPrefsWritesSocksProxy(t *testing.T) {
+	app := &App{}
+	dir := t.TempDir()
+
+	if err := app.setupStealthPrefs(dir, "socks5://127.0.0.1:7891"); err != nil {
+		t.Fatalf("setupStealthPrefs: %v", err)
+	}
+
+	prefs := parsePrefsFile(t, filepath.Join(dir, "prefs.js"))
+	if prefs["network.proxy.type"] != "1" {
+		t.Fatalf("network.proxy.type = %q, want 1", prefs["network.proxy.type"])
+	}
+	if prefs["network.proxy.socks"] != `"127.0.0.1"` || prefs["network.proxy.socks_port"] != "7891" {
+		t.Fatalf("socks proxy prefs = %v, want 127.0.0.1:7891", prefs)
+	}
+}
