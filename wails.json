@@ -8,8 +8,7 @@
   "frontend:dev:watcher": "npm run dev",
   "frontend:dev:serverUrl": "auto",
   "author": {
-    "name": "HMuSeaB",
-    "email": "3623058050@qq.com"
+    "name": "HMuSeaB"
   },
   "info": {
     "companyName": "HMuSeaB",
